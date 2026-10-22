@@ -28,6 +28,48 @@ Gate: MET - safe path + feasible toolchain.
 ## M1 - Desktop shell + real media import (DONE 2026-10-22)
 Gate MET: owner opened the debug .app, imported test-media/clip-a.mp4 by hand, confirmed preview playback
   and properties (1280x720, h264, 30 fps, audio) - owner-reported, not automated.
+## M6 - Local auto-edit pipeline, no API (DONE 2026-10-22)
+Approved by owner: whisper-cpp, multilingual ggml-small.bin, crates ureq/ab_glyph/image. Footage: Tagalog/Taglish.
+Installed: whisper-cpp 1.9.5 (brew). Model ~/Library/Application Support/ai-reel-maker/models/ggml-small.bin,
+  487,601,967 B, sha256 1be3a9b2...987b = Hugging Face x-linked-etag. Crates: ureq 2, ab_glyph 0.2, image 0.25 (png).
+Test clip: test-media/clip-speech.mp4 (28.85s, 1920x1080 testsrc + macOS `say` Samantha reading a Taglish script
+  with dead air, "um", repeated "how to make", fumbled "strong cough"). No Filipino TTS voice on this Mac.
+Findings + fixes:
+- whisper.cpp word times smear across pauses -> split audio on FFmpeg silencedetect (-35 dB, >=0.35s) and
+  transcribe all chunks in ONE whisper-cli run (model loads once), offset per chunk.
+- Still ~0.3s late inside chunks ("um" leaked into output; caught by re-transcription check). DTW anchors
+  were -1 because flash attention is on by default -> `-dtw small -nfa`. Word edges now = quietest point of
+  the 10 ms RMS envelope between consecutive DTW anchors ("dtw+energy"). "um" now 6.68-6.98 (audio 6.65-6.95).
+- FFmpeg build has no libass/freetype -> captions rasterized in Rust (Arial Bold, white + black outline,
+  wrapped) and overlaid with `overlay=enable='between(t,a,b)'`; .srt sidecar written.
+- verify_export.py flaked (random "PSNR n/a"): with `-frames:v 1` this FFmpeg sometimes skips the psnr
+  filter's uninit (no summary, unflushed stats). Fixed: per-input `-t 0.02` + `psnr=stats_file`. Stable
+  37/37 x6 runs. Flake could only cause false FAILs; earlier M3-M5 PASSes stand (re-run: 10/10, 8/8, 8/8).
+Code: src-tauri/src/{transcribe,plan,captions,autoedit}.rs, bin/autoedit.rs (CLI), render.rs (+Fit::Crop,
+  caption overlays, render_to). Validator: source_id, 0<=start<end<=dur, min 0.3s, no overlaps, snap to word
+  edges, removal evidence ids exist + near range, removals may not cut kept speech, captions inside segment
+  and >=60% words match transcript (fuzzy, spelling fixes allowed + warned).
+Run (actual):
+- `autoedit prepare test-media/clip-speech.mp4 --lang auto` -> 59 words in 2.1s, lang en, request.json
+  (system 1,737 chars + user 1,418 chars + schema) written, NOT sent.
+- Fixture plan test-media/clip-speech.fixture-plan.json (hand-written stand-in for Claude). First fixture
+  draft was REJECTED by validator (repeat evidence word 19 outside range) -> fixed fixture.
+- `autoedit render` -> output.mp4 17.40s 1080x1920 h264+aac, 8 segments, 17 captions, ~3s incl re-check.
+  Re-transcription: kept-words match 94% (diffs only Whisper Tagalog spelling dalee/dalai, salamit/salamate),
+  "how to make" x1, no "cough", no "um".
+- `verify_export.py output.mp4 --validated plan.validated.json --source clip-speech.mp4 --fit crop --srt
+  output.srt` -> 37/37 PASS (segments above caption band 57.7-60.5 dB; every caption band 16-22 dB).
+- cargo test --lib 30/30; npm test 8/8; npm run build OK; app+CLI build OK; source checksums OK.
+Not done: no Claude call (M7); no UI button (M8); real Tagalog speech untested (synthetic EN voice only).
+
+## Option B (Claude API auto-edit) - audit + proposal (2026-10-22, approved for M6)
+Owner chose Option B (supersedes runbook's "defer AI"). Proposal: docs/OPTION_B_PLAN.md.
+Audit: no transcription/AI/caption/9:16 code exists. Creds: ANTHROPIC_API_KEY/AUTH_TOKEN/PROFILE unset, no
+  ~/.config/anthropic, no `ant`, no Keychain item (presence-only checks). FFmpeg lacks libass/freetype ->
+  no subtitles/drawtext; plan = Rust-rendered caption PNGs + overlay. whisper-cpp 1.9.5 in brew, not installed.
+Pricing (live page, 2026-10-22): Opus 5.5 $4/$20, Sonnet 5.5 $2/$10, Haiku 5.5 $0.10/$0.50 per MTok.
+Estimate per test call (Opus 5.5): ~$0.09-0.15, ceiling ~$0.34. No paid calls, installs, or uploads done.
+
 ## M5 - Stabilize and deliver (DONE 2026-10-22)
 - Review: no critical failures/usability blockers found; no code changes needed beyond M2 label fix.
 - README.md rewritten (was the Tauri template): prerequisites + verified versions, run, test, export

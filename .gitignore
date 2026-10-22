@@ -24,3 +24,4 @@ dist-ssr
 *.sw?
 _to_delete/
 exports/
+projects/

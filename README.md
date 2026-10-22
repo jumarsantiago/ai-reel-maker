@@ -87,11 +87,36 @@ How export works:
 - It never writes over a source clip. It only replaces an existing file when you confirmed that in the macOS save dialog.
 - Your original media is only read, never modified.
 
+## Auto-edit pipeline (Option B, in progress)
+
+These local steps need `brew install whisper-cpp` and the multilingual Whisper model at
+`~/Library/Application Support/ai-reel-maker/models/ggml-small.bin` (or set `AIRM_WHISPER_MODEL`).
+**No network calls happen in these steps.** The Claude planning call is a separate, approved step (M7).
+
+```bash
+cd src-tauri && cargo build --release --bin autoedit && cd ..
+src-tauri/target/release/autoedit prepare test-media/clip-speech.mp4 --lang auto
+src-tauri/target/release/autoedit render projects/<id>-clip-speech test-media/clip-speech.fixture-plan.json
+python3 -I scripts/verify_export.py projects/<id>-clip-speech/output.mp4 \
+  --validated projects/<id>-clip-speech/plan.validated.json --source test-media/clip-speech.mp4 \
+  --fit crop --srt projects/<id>-clip-speech/output.srt
+```
+
+- **`prepare`** extracts the audio and finds silences (FFmpeg). It transcribes each speech chunk locally with whisper.cpp
+  and places word edges using DTW anchors and audio energy. It then writes `transcript.json` and **`request.json`**,
+  the exact Messages API body that would be sent: transcript and metadata only, with no media or paths. Nothing is sent.
+- **`render`** validates a plan and writes `plan.validated.json`, or `plan.errors.json` if it's rejected.
+  It draws the caption PNGs and `output.srt`, then renders a 1080×1920 `output.mp4` (centre-cropped).
+  Finally it re-transcribes the output and records how many of the kept words it heard (`render_report.json`).
+- **Project folders** are `projects/<unix-time>-<clip>/`, which git ignores. Each step is logged in `log.txt`.
+- The design, data-sharing and cost proposal is in `docs/OPTION_B_PLAN.md`.
+
 ## Project layout
 
 ```
 src/                 React UI (App.tsx), timeline model (timeline.ts) + tests
-src-tauri/src/       Rust backend: media.rs (ffprobe), render.rs (export), lib.rs (Tauri commands)
+src-tauri/src/       Rust backend: media.rs (ffprobe), render.rs (export), lib.rs (Tauri commands),
+                     transcribe.rs, plan.rs (schema/request/validator), captions.rs, autoedit.rs, bin/autoedit.rs
 scripts/             verify_export.py (independent output inspection)
 test-media/          synthetic test clips + SHA256SUMS
 exports/             default place for test exports (git-ignored)
@@ -106,7 +131,7 @@ WORKLOG.md           milestone log with verified commands and results
 - **Always re-encodes:** there's no fast "copy" path for clips that don't need it.
 - **No project save or reopen, no text overlays, no undo.**
 - **Clip-level previews only:** you preview one clip (confined to its trim), not the whole timeline played back.
-- **No AI features yet.** Auto-editing, speech-to-text and scene detection are deferred by the sprint runbook.
+- **AI auto-edit is partly built.** Local transcription, plan validation and 9:16 caption rendering work via the CLI. The Claude call (M7) and the UI button (M8) are not done yet.
 - **Content Security Policy is disabled** (`csp: null`) for the prototype. The asset protocol starts with an
   empty scope and only lets the preview read the files you import.
 - **Tested on:** macOS 27.0.1 (arm64), with H.264/AAC MP4 test patterns and one real H.264 recording.

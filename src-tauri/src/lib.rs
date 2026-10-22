@@ -1,5 +1,9 @@
-mod media;
-mod render;
+pub mod autoedit;
+pub mod captions;
+pub mod media;
+pub mod plan;
+pub mod render;
+pub mod transcribe;
 
 use media::MediaInfo;
 use tauri::{Emitter, Manager};

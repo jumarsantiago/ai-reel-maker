@@ -7,7 +7,7 @@ use std::process::Command;
 
 pub const ALLOWED_EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "webm", "mkv"];
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaInfo {
     pub path: String,

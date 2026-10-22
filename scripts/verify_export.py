@@ -3,6 +3,12 @@
 
 Usage:
   python3 -I scripts/verify_export.py OUTPUT.mp4 SOURCE:IN:OUT [SOURCE:IN:OUT ...]
+  python3 -I scripts/verify_export.py OUTPUT.mp4 --validated plan.validated.json --source SRC.mp4 \
+      [--fit crop] [--srt output.srt]
+
+--fit crop   compare against the source scaled-to-cover and centre-cropped (vertical reels).
+--srt FILE   frame matching then uses only the area above the caption band, and each caption is
+             checked to be visible: its band must differ clearly from the uncaptioned source.
 
 Checks: file exists and is non-empty; ffprobe finds an H.264 video stream; total duration matches the
 sum of segments; every frame decodes; and for each segment, frames near its start and end match the
@@ -15,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 DURATION_TOL = 0.15  # seconds
 PSNR_MIN = 30.0      # dB; a wrong frame or wrong clip scores far lower on the test patterns
@@ -42,28 +49,80 @@ def probe(path):
     return json.loads(out)
 
 
-def psnr(output, t_out, source, t_src, w, h):
-    fit = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1"
-    r = subprocess.run(
-        [FFMPEG, "-hide_banner", "-nostdin", "-ss", f"{t_out:.4f}", "-i", output, "-ss", f"{t_src:.4f}", "-i", source,
-         "-filter_complex", f"[1:v]{fit},format=yuv420p[s];[0:v]setsar=1,format=yuv420p[o];[o][s]psnr",
-         "-frames:v", "1", "-f", "null", "-"],
-        capture_output=True, text=True,
-    )
-    m = re.search(r"average:(inf|[\d.]+)", r.stderr)
+CAPTION_BAND = (0.60, 0.80)  # fraction of height; captions are centred at 0.70
+
+
+def psnr(output, t_out, source, t_src, w, h, fit_mode="pad", band=None):
+    if fit_mode == "crop":
+        fit = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1"
+    else:
+        fit = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+    roi = ""
+    if band is not None:  # (y0, y1) as fractions of height
+        y0, y1 = int(band[0] * h) // 2 * 2, int(band[1] * h) // 2 * 2
+        roi = f",crop={w}:{y1 - y0}:0:{y0}"
+    # Per-frame stats go to a file: this FFmpeg build sometimes drops the psnr summary log line.
+    fd, stats = tempfile.mkstemp(suffix=".psnr.log")
+    os.close(fd)
+    try:
+        subprocess.run(
+            # Inputs are limited to ~1 frame with -t so the graph ends at natural EOF (with
+            # -frames:v the filter is sometimes torn down before it flushes its stats).
+            [FFMPEG, "-hide_banner", "-nostdin", "-ss", f"{t_out:.4f}", "-t", "0.02", "-i", output,
+             "-ss", f"{t_src:.4f}", "-t", "0.02", "-i", source,
+             "-filter_complex",
+             f"[1:v]{fit}{roi},format=yuv420p[s];[0:v]setsar=1{roi},format=yuv420p[o];[o][s]psnr=stats_file={stats}",
+             "-an", "-f", "null", "-"],
+            capture_output=True, text=True,
+        )
+        m = re.search(r"psnr_avg:(inf|[\d.]+)", open(stats).read())
+    finally:
+        os.remove(stats)
     if not m:
         return None
     return float("inf") if m.group(1) == "inf" else float(m.group(1))
 
 
+def parse_srt(path):
+    caps = []
+    for block in open(path, encoding="utf-8").read().strip().split("\n\n"):
+        lines = block.strip().splitlines()
+        if len(lines) < 3:
+            continue
+        to_s = lambda x: (lambda h, m, s: int(h) * 3600 + int(m) * 60 + float(s.replace(",", ".")))(*x.strip().split(":"))
+        a, b = lines[1].split("-->")
+        caps.append((to_s(a), to_s(b), " ".join(lines[2:])))
+    return caps
+
+
 def main():
-    if len(sys.argv) < 3:
+    args = sys.argv[1:]
+    def take(flag):
+        if flag in args:
+            i = args.index(flag)
+            value = args[i + 1]
+            del args[i:i + 2]
+            return value
+        return None
+    fit_mode = take("--fit") or "pad"
+    srt = take("--srt")
+    validated = take("--validated")
+    source = take("--source")
+    if not args or (validated is None and len(args) < 2) or fit_mode not in ("pad", "crop"):
         sys.exit(__doc__)
-    output = sys.argv[1]
+    output = args[0]
     segments = []
-    for spec in sys.argv[2:]:
+    if validated:
+        if not source:
+            sys.exit("--validated needs --source")
+        for seg in json.load(open(validated))["segments"]:
+            segments.append((source, float(seg["start"]), float(seg["end"])))
+    for spec in args[1:]:
         src, a, b = spec.rsplit(":", 2)
         segments.append((src, float(a), float(b)))
+    captions = parse_srt(srt) if srt else []
+    # With captions, frame matching uses only the area above the caption band.
+    match_band = (0.0, CAPTION_BAND[0]) if captions else None
 
     results = []
 
@@ -105,11 +164,31 @@ def main():
     for i, (src, a, b) in enumerate(segments, 1):
         length = b - a
         for label, rel in (("start", offset), ("end", length - offset)):
-            p = psnr(output, start + rel, src, a + rel, w, h)
+            p = psnr(output, start + rel, src, a + rel, w, h, fit_mode, match_band)
             check(f"segment {i} {label}", p is not None and p >= PSNR_MIN,
                   f"out@{start + rel:.3f}s vs {os.path.basename(src)}@{a + rel:.3f}s PSNR "
                   f"{'n/a' if p is None else ('inf' if p == float('inf') else f'{p:.1f} dB')}")
         start += length
+
+    # Captions: at each caption's midpoint the caption band must differ clearly from the source
+    # (text drawn there), while the area above it still matches (same frame, correct timing).
+    if captions:
+        bounds, t = [], 0.0
+        for src, a, b in segments:
+            bounds.append((t, t + (b - a), src, a))
+            t += b - a
+        for i, (ca, cb, text) in enumerate(captions, 1):
+            mid = (ca + cb) / 2
+            seg = next((x for x in bounds if x[0] <= mid < x[1]), None)
+            if seg is None:
+                check(f"caption {i}", False, f"{text!r} at {mid:.2f}s is outside every segment")
+                continue
+            src_t = seg[3] + (mid - seg[0])
+            band = psnr(output, mid, seg[2], src_t, w, h, fit_mode, CAPTION_BAND)
+            above = psnr(output, mid, seg[2], src_t, w, h, fit_mode, match_band)
+            ok = band is not None and above is not None and above >= PSNR_MIN and band <= above - 8
+            check(f"caption {i}", ok, f"{text!r} @{mid:.2f}s band {band if band is None else round(band, 1)} dB "
+                  f"vs above {above if above is None else round(above, 1)} dB")
 
     passed = sum(results)
     print(f"\n{passed}/{len(results)} checks passed")

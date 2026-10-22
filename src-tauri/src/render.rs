@@ -56,6 +56,27 @@ pub struct Plan {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    pub fit: Fit,
+    pub overlays: Vec<Overlay>,
+}
+
+/// How each clip fills the output frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Fit {
+    /// Scale down to fit, letterbox the rest (timeline export).
+    Pad,
+    /// Scale up to cover, centre-crop the overflow (vertical reels).
+    Crop,
+}
+
+/// A still image (e.g. a caption PNG) shown over the output between `start` and `end`
+/// (output-timeline seconds), horizontally centred with its centre at `y_center_frac` of the height.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Overlay {
+    pub image: PathBuf,
+    pub start: f64,
+    pub end: f64,
+    pub y_center_frac: f64,
 }
 
 fn even(n: u32) -> u32 {
@@ -103,6 +124,8 @@ pub fn plan_segments(
         width: even(first.width),
         height: even(first.height),
         fps: if (1..=120).contains(&fps) { fps } else { 30 },
+        fit: Fit::Pad,
+        overlays: Vec::new(),
     })
 }
 
@@ -146,10 +169,11 @@ pub fn build_filter_graph(plan: &Plan) -> String {
     let mut graph = String::new();
     let mut concat_inputs = String::new();
     for (i, s) in plan.segments.iter().enumerate() {
-        graph += &format!(
-            "[{i}:v:0]setpts=PTS-STARTPTS,scale={w}:{h}:force_original_aspect_ratio=decrease,\
-             pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p[v{i}];"
-        );
+        let frame = match plan.fit {
+            Fit::Pad => format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"),
+            Fit::Crop => format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"),
+        };
+        graph += &format!("[{i}:v:0]setpts=PTS-STARTPTS,{frame},setsar=1,fps={fps},format=yuv420p[v{i}];");
         concat_inputs += &format!("[v{i}]");
         if any_audio {
             let len = secs(s.length);
@@ -168,10 +192,27 @@ pub fn build_filter_graph(plan: &Plan) -> String {
         }
     }
     let n = plan.segments.len();
+    let video_out = if plan.overlays.is_empty() { "[outv]" } else { "[cv]" };
     if any_audio {
-        graph += &format!("{concat_inputs}concat=n={n}:v=1:a=1[outv][outa]");
+        graph += &format!("{concat_inputs}concat=n={n}:v=1:a=1{video_out}[outa]");
     } else {
-        graph += &format!("{concat_inputs}concat=n={n}:v=1:a=0[outv]");
+        graph += &format!("{concat_inputs}concat=n={n}:v=1:a=0{video_out}");
+    }
+    // Overlay inputs follow the segment inputs; each is enabled only during its time window.
+    let mut prev = "cv".to_string();
+    for (k, o) in plan.overlays.iter().enumerate() {
+        let last = k + 1 == plan.overlays.len();
+        let label = if last { "outv".to_string() } else { format!("o{k}") };
+        let tail = if last { ",format=yuv420p" } else { "" };
+        graph += &format!(
+            ";[{prev}][{idx}:v]overlay=x=(main_w-overlay_w)/2:y=main_h*{y:.4}-overlay_h/2:\
+             enable='between(t,{a},{b})'{tail}[{label}]",
+            idx = n + k,
+            y = o.y_center_frac,
+            a = secs(o.start),
+            b = secs(o.end),
+        );
+        prev = label;
     }
     graph
 }
@@ -184,6 +225,10 @@ pub fn build_ffmpeg_args(plan: &Plan, output: &Path) -> Vec<OsString> {
     for s in &plan.segments {
         args.extend(["-ss".into(), secs(s.in_point).into(), "-t".into(), secs(s.length).into(), "-i".into()]);
         args.push(s.path.clone().into_os_string());
+    }
+    for o in &plan.overlays {
+        args.push("-i".into());
+        args.push(o.image.clone().into_os_string());
     }
     args.push("-filter_complex".into());
     args.push(build_filter_graph(plan).into());
@@ -220,6 +265,11 @@ pub fn export(req: &ExportRequest, on_progress: impl Fn(f64)) -> Result<ExportRe
     let plan = plan_segments(&req.segments, media::probe)?;
     let sources: Vec<PathBuf> = plan.segments.iter().map(|s| s.path.clone()).collect();
     let out = validate_output_path(&req.output_path, &sources, req.overwrite_confirmed)?;
+    render_to(&plan, &out, req.overwrite_confirmed, on_progress)
+}
+
+/// Renders an already-validated plan to an already-validated output path (temp file, inspect, rename).
+pub fn render_to(plan: &Plan, out: &Path, overwrite_confirmed: bool, on_progress: impl Fn(f64)) -> Result<ExportResult, String> {
     let ffmpeg = media::find_tool("ffmpeg").ok_or("FFmpeg not found. Install it (e.g. `brew install ffmpeg`).")?;
     let temp = temp_path_for(&out);
     let total: f64 = plan.segments.iter().map(|s| s.length).sum();
@@ -261,7 +311,7 @@ pub fn export(req: &ExportRequest, on_progress: impl Fn(f64)) -> Result<ExportRe
         Ok(i) => i,
         Err(e) => return fail(format!("Rendered file failed inspection: {e}")),
     };
-    if out.exists() && !req.overwrite_confirmed {
+    if out.exists() && !overwrite_confirmed {
         return fail("Output file appeared during export; not overwriting it.".into());
     }
     if let Err(e) = std::fs::rename(&temp, &out) {
@@ -367,6 +417,27 @@ mod tests {
         assert!(g.ends_with("[v0]concat=n=1:v=1:a=0[outv]"));
         let args = build_ffmpeg_args(&plan, Path::new("/o.mp4"));
         assert!(args.iter().any(|a| a == "-an"));
+    }
+
+    #[test]
+    fn crop_fit_and_caption_overlays() {
+        let mut plan = plan_segments(&[seg("/v/a.mp4", 0.0, 2.0), seg("/v/a.mp4", 3.0, 4.0)], fake_probe).unwrap();
+        plan.width = 1080;
+        plan.height = 1920;
+        plan.fit = Fit::Crop;
+        plan.overlays = vec![
+            Overlay { image: "/p/000.png".into(), start: 0.0, end: 1.5, y_center_frac: 0.7 },
+            Overlay { image: "/p/001.png".into(), start: 1.5, end: 3.0, y_center_frac: 0.7 },
+        ];
+        let g = build_filter_graph(&plan);
+        assert!(g.contains("scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"));
+        assert!(!g.contains("pad="));
+        assert!(g.contains("concat=n=2:v=1:a=1[cv][outa]"));
+        assert!(g.contains("[cv][2:v]overlay=x=(main_w-overlay_w)/2:y=main_h*0.7000-overlay_h/2:enable='between(t,0.000,1.500)'[o0]"));
+        assert!(g.ends_with("[o0][3:v]overlay=x=(main_w-overlay_w)/2:y=main_h*0.7000-overlay_h/2:enable='between(t,1.500,3.000)',format=yuv420p[outv]"));
+        let args: Vec<String> = build_ffmpeg_args(&plan, Path::new("/o.mp4")).into_iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let inputs: Vec<&String> = args.windows(2).filter(|w| w[0] == "-i").map(|w| &w[1]).collect();
+        assert_eq!(inputs, ["/v/a.mp4", "/v/a.mp4", "/p/000.png", "/p/001.png"]);
     }
 
     #[test]

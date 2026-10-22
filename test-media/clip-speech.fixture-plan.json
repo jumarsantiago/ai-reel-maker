@@ -1,0 +1,269 @@
+{
+ "summary": {
+  "title": "Perfect iced coffee at home (FIXTURE - hand-written stand-in for a Claude plan)",
+  "overall_rationale": "Keep every instruction, cut pauses, the filler, the repeated phrase and the fumbled 'strong cough'.",
+  "overall_confidence": "high"
+ },
+ "segments": [
+  {
+   "source_id": "clip_1",
+   "start": 0.01,
+   "end": 2.64,
+   "purpose": "hook / greeting",
+   "rationale": "Channel intro",
+   "confidence": "high"
+  },
+  {
+   "source_id": "clip_1",
+   "start": 4.93,
+   "end": 6.55,
+   "purpose": "topic setup",
+   "rationale": "Ends before 'um'",
+   "confidence": "high"
+  },
+  {
+   "source_id": "clip_1",
+   "start": 8.12,
+   "end": 10.51,
+   "purpose": "topic",
+   "rationale": "Second, complete 'how to make'",
+   "confidence": "high"
+  },
+  {
+   "source_id": "clip_1",
+   "start": 11.29,
+   "end": 13.33,
+   "purpose": "step 1",
+   "rationale": "Clean first 'strong coffee'",
+   "confidence": "high"
+  },
+  {
+   "source_id": "clip_1",
+   "start": 15.73,
+   "end": 16.68,
+   "purpose": "step 1 cont.",
+   "rationale": "Resumes after the fumble",
+   "confidence": "medium"
+  },
+  {
+   "source_id": "clip_1",
+   "start": 18.69,
+   "end": 20.95,
+   "purpose": "Taglish aside",
+   "rationale": "Relatable line",
+   "confidence": "high"
+  },
+  {
+   "source_id": "clip_1",
+   "start": 21.68,
+   "end": 24.8,
+   "purpose": "steps 2-3",
+   "rationale": "Core instructions",
+   "confidence": "high"
+  },
+  {
+   "source_id": "clip_1",
+   "start": 26.43,
+   "end": 28.71,
+   "purpose": "outro",
+   "rationale": "Sign-off",
+   "confidence": "high"
+  }
+ ],
+ "removals": [
+  {
+   "start": 2.64,
+   "end": 4.93,
+   "kind": "dead_air",
+   "evidence_word_ids": [
+    6,
+    7
+   ],
+   "rationale": "2.3 s pause",
+   "confidence": "high"
+  },
+  {
+   "start": 6.55,
+   "end": 7.11,
+   "kind": "filler",
+   "evidence_word_ids": [
+    13
+   ],
+   "rationale": "'um'",
+   "confidence": "high"
+  },
+  {
+   "start": 7.11,
+   "end": 8.12,
+   "kind": "repeat",
+   "evidence_word_ids": [
+    14,
+    15,
+    16
+   ],
+   "rationale": "'how to make' said twice; drop the first, keep the second",
+   "confidence": "high"
+  },
+  {
+   "start": 10.51,
+   "end": 11.29,
+   "kind": "dead_air",
+   "evidence_word_ids": [
+    25,
+    26
+   ],
+   "rationale": "pause",
+   "confidence": "high"
+  },
+  {
+   "start": 13.33,
+   "end": 15.73,
+   "kind": "mistake",
+   "evidence_word_ids": [
+    31,
+    32,
+    33,
+    34
+   ],
+   "rationale": "False start 'strong cough' and repeated 'strong coffee'",
+   "confidence": "high"
+  },
+  {
+   "start": 16.68,
+   "end": 18.69,
+   "kind": "dead_air",
+   "evidence_word_ids": [
+    38,
+    39
+   ],
+   "rationale": "pause",
+   "confidence": "high"
+  },
+  {
+   "start": 20.95,
+   "end": 21.68,
+   "kind": "dead_air",
+   "evidence_word_ids": [
+    42,
+    43
+   ],
+   "rationale": "pause",
+   "confidence": "medium"
+  },
+  {
+   "start": 24.8,
+   "end": 26.43,
+   "kind": "dead_air",
+   "evidence_word_ids": [
+    52,
+    53
+   ],
+   "rationale": "pause",
+   "confidence": "high"
+  }
+ ],
+ "captions": [
+  {
+   "segment_index": 0,
+   "start": 0.01,
+   "end": 1.13,
+   "text": "Hi everyone,"
+  },
+  {
+   "segment_index": 0,
+   "start": 1.1,
+   "end": 2.64,
+   "text": "welcome back to my channel."
+  },
+  {
+   "segment_index": 1,
+   "start": 4.96,
+   "end": 5.85,
+   "text": "Today I'm going"
+  },
+  {
+   "segment_index": 1,
+   "start": 5.82,
+   "end": 6.55,
+   "text": "to show you"
+  },
+  {
+   "segment_index": 2,
+   "start": 8.15,
+   "end": 8.77,
+   "text": "how to make"
+  },
+  {
+   "segment_index": 2,
+   "start": 8.74,
+   "end": 10.05,
+   "text": "the perfect iced coffee"
+  },
+  {
+   "segment_index": 2,
+   "start": 10.02,
+   "end": 10.51,
+   "text": "at home."
+  },
+  {
+   "segment_index": 3,
+   "start": 11.32,
+   "end": 12.47,
+   "text": "First, you need"
+  },
+  {
+   "segment_index": 3,
+   "start": 12.44,
+   "end": 13.33,
+   "text": "strong coffee,"
+  },
+  {
+   "segment_index": 4,
+   "start": 15.76,
+   "end": 16.68,
+   "text": "and lots of ice."
+  },
+  {
+   "segment_index": 5,
+   "start": 18.72,
+   "end": 20.48,
+   "text": "Sobrang dali lang nito,"
+  },
+  {
+   "segment_index": 5,
+   "start": 20.45,
+   "end": 20.95,
+   "text": "promise!"
+  },
+  {
+   "segment_index": 6,
+   "start": 21.71,
+   "end": 22.59,
+   "text": "Pour the milk,"
+  },
+  {
+   "segment_index": 6,
+   "start": 22.56,
+   "end": 23.52,
+   "text": "add the syrup,"
+  },
+  {
+   "segment_index": 6,
+   "start": 23.49,
+   "end": 24.8,
+   "text": "and stir. That's it!"
+  },
+  {
+   "segment_index": 7,
+   "start": 26.46,
+   "end": 27.29,
+   "text": "Salamat,"
+  },
+  {
+   "segment_index": 7,
+   "start": 27.26,
+   "end": 28.71,
+   "text": "and see you next time!"
+  }
+ ]
+}

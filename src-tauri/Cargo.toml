@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "AI Reel Maker Day 1 prototype"
 authors = ["you"]
 edition = "2024"
+default-run = "ai-reel-maker"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -23,6 +24,9 @@ tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+ab_glyph = "0.2.32"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

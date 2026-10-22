@@ -57,7 +57,7 @@ export was checked independently: its streams, duration, full decode, and frame 
 - Leftovers from an earlier, out-of-plan session are still in the folder: `_to_delete/_failed_clone_kit/` (an empty
   failed git clone) and `WORKLOG.old-herk.md`. You can safely delete them; I didn't.
 - `exports/` holds the three test exports and is ignored by git.
-- The project isn't a git repository yet.
+- Git: initialized on `main` with an initial commit. `WORKLOG.old-herk.md` is left untracked.
 
 ## Suggested next milestone
 

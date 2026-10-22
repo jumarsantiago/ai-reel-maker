@@ -37,7 +37,7 @@ Gate MET: owner opened the debug .app, imported test-media/clip-a.mp4 by hand, c
   `exports/m5-release.mp4` "0:08.00 1280x720 audio 1.2 MB"; verify_export 8/8 PASS (PSNR 56.0/55.2, 44.9/44.9).
   Typing a name without extension -> saved as .mp4 correctly.
 - test-media checksums OK; 0 temp leftovers. COMPLETION_REPORT.md written.
-Day 1 status: all P0 done + verified. P1 not started. Not a git repo yet. Owner may delete `_to_delete/`,
+Day 1 status: all P0 done + verified. P1 not started. Git: initial commit on `main` (49 files; test clips included, WORKLOG.old-herk.md left untracked). Owner may delete `_to_delete/`,
   `WORKLOG.old-herk.md` (untouched by me).
 
 ## M4 - End-to-end verification (DONE 2026-10-22)

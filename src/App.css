@@ -101,3 +101,8 @@ dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; 
 .field input:focus-visible { outline: 2px solid var(--accent); }
 .modal .small { font-size: 12px; white-space: normal; margin-top: 12px; }
 .modal.settings .success, .modal.settings .errors { white-space: normal; font-family: inherit; }
+
+/* Auto-cut */
+.auto-cut-box { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
+.btn.wide { width: 100%; }
+.small-note { font-size: 12px; margin: 8px 0 0; white-space: normal; }

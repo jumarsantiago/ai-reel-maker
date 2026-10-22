@@ -87,6 +87,25 @@ How export works:
 - It never writes over a source clip. It only replaces an existing file when you confirmed that in the macOS save dialog.
 - Your original media is only read, never modified.
 
+## Auto-cut (free, no AI)
+
+In the app, select a video in the media bin and click **✨ Auto-cut (free, no AI)**. On this Mac it will:
+- transcribe the speech with whisper.cpp;
+- cut pauses longer than 0.4s, fillers (um/uh/ah/er/hmm) and repeated or restarted phrases, keeping the last attempt;
+- add captions and render a 1080×1920 reel;
+- re-transcribe the result as a check.
+
+Results go to `~/Movies/AI Reel Maker/<time>-<clip>/output.mp4`, and **Add to media & preview** loads the reel back into the app.
+Tagalog words like "ano" and "parang" are never cut automatically, because they're often real words. Lines are never
+reordered and the hook isn't changed; that's what the Claude planner (below) adds. CLI equivalent:
+
+```bash
+src-tauri/target/release/autoedit autocut test-media/clip-speech.mp4
+```
+
+The **Settings** window (top bar) stores a Claude API key in the macOS login Keychain. Only the Claude planner needs it,
+and that is billed separately from Claude Pro.
+
 ## Auto-edit pipeline (Option B, in progress)
 
 These local steps need `brew install whisper-cpp` and the multilingual Whisper model at
@@ -116,7 +135,8 @@ python3 -I scripts/verify_export.py projects/<id>-clip-speech/output.mp4 \
 ```
 src/                 React UI (App.tsx), timeline model (timeline.ts) + tests
 src-tauri/src/       Rust backend: media.rs (ffprobe), render.rs (export), lib.rs (Tauri commands),
-                     transcribe.rs, plan.rs (schema/request/validator), captions.rs, autoedit.rs, bin/autoedit.rs
+                     transcribe.rs, plan.rs (schema/request/validator), autoplan.rs (Auto-cut rules), api.rs,
+                     captions.rs, autoedit.rs, bin/autoedit.rs
 scripts/             verify_export.py (independent output inspection)
 test-media/          synthetic test clips + SHA256SUMS
 exports/             default place for test exports (git-ignored)

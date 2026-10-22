@@ -35,6 +35,25 @@ type ExportState =
   | { kind: "done"; result: ExportResult }
   | { kind: "error"; message: string };
 
+type AutoCutResult = {
+  projectDir: string;
+  outputPath: string;
+  durationSec: number;
+  sourceDurationSec: number;
+  segments: number;
+  captions: number;
+  pausesRemoved: number;
+  fillersRemoved: number;
+  repeatsRemoved: number;
+  keptWordsMatch: number;
+};
+
+type AutoCutState =
+  | { kind: "idle" }
+  | { kind: "running"; source: string; stage: string; progress: number }
+  | { kind: "done"; result: AutoCutResult }
+  | { kind: "error"; message: string };
+
 type KeyStatus = { source: "env" | "keychain" | "none"; account: string };
 
 type Selection = { kind: "media"; path: string } | { kind: "clip"; id: string } | null;
@@ -45,6 +64,10 @@ function formatTime(sec: number) {
   const m = Math.floor(sec / 60);
   const s = (sec % 60).toFixed(2).padStart(5, "0");
   return `${m}:${s}`;
+}
+
+function plural(n: number, word: string) {
+  return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
 function formatSize(bytes: number) {
@@ -60,6 +83,7 @@ function App() {
   const [trimDraft, setTrimDraft] = useState({ in: "", out: "" });
   const [trimError, setTrimError] = useState<string | null>(null);
   const [exportState, setExportState] = useState<ExportState>({ kind: "idle" });
+  const [autoCut, setAutoCut] = useState<AutoCutState>({ kind: "idle" });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [keyStatus, setKeyStatus] = useState<KeyStatus | null>(null);
   const [keyInput, setKeyInput] = useState("");
@@ -189,6 +213,36 @@ function App() {
       setExportState({ kind: "error", message: String(e) });
     } finally {
       unlisten();
+    }
+  }
+
+  async function runAutoCut(m: MediaInfo) {
+    setAutoCut({ kind: "running", source: m.fileName, stage: "Starting…", progress: 0 });
+    const offStage = await listen<string>("autocut-stage", (e) =>
+      setAutoCut((s) => (s.kind === "running" ? { ...s, stage: e.payload } : s)),
+    );
+    const offProgress = await listen<number>("autocut-progress", (e) =>
+      setAutoCut((s) => (s.kind === "running" ? { ...s, progress: e.payload } : s)),
+    );
+    try {
+      const result = await invoke<AutoCutResult>("auto_cut", { path: m.path });
+      setAutoCut({ kind: "done", result });
+    } catch (e) {
+      setAutoCut({ kind: "error", message: String(e) });
+    } finally {
+      offStage();
+      offProgress();
+    }
+  }
+
+  async function addResultToMedia(path: string) {
+    try {
+      const info = await invoke<MediaInfo>("probe_media", { path });
+      setMedia((prev) => (prev.some((x) => x.path === info.path) ? prev : [...prev, info]));
+      setSelection({ kind: "media", path: info.path });
+      setAutoCut({ kind: "idle" });
+    } catch (e) {
+      setAutoCut({ kind: "error", message: String(e) });
     }
   }
 
@@ -355,6 +409,7 @@ function App() {
             </div>
           </div>
         ) : selectedMedia ? (
+          <>
           <dl>
             <dt>File</dt><dd title={selectedMedia.path}>{selectedMedia.fileName}</dd>
             <dt>Duration</dt><dd>{formatTime(selectedMedia.durationSec)}</dd>
@@ -364,6 +419,22 @@ function App() {
             <dt>Audio</dt><dd>{selectedMedia.hasAudio ? "Yes" : "None"}</dd>
             <dt>Size</dt><dd>{formatSize(selectedMedia.sizeBytes)}</dd>
           </dl>
+          <div className="auto-cut-box">
+            <button
+              className="btn primary wide"
+              onClick={() => runAutoCut(selectedMedia)}
+              disabled={autoCut.kind === "running" || !selectedMedia.hasAudio}
+              title={selectedMedia.hasAudio ? "Cut pauses, fillers and repeats automatically" : "Needs a video with speech"}
+            >
+              ✨ Auto-cut (free, no AI)
+            </button>
+            <p className="muted small-note">
+              {selectedMedia.hasAudio
+                ? "Removes long pauses, um/uh and repeated phrases, then makes a 9:16 reel with captions. Runs on this Mac."
+                : "This video has no audio, so there is nothing to transcribe."}
+            </p>
+          </div>
+          </>
         ) : (
           <p className="muted">Select a clip to see its details.</p>
         )}
@@ -400,6 +471,56 @@ function App() {
             : plan.error}
         </div>
       </footer>
+
+      {autoCut.kind !== "idle" && (
+        <div className="modal-backdrop">
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="autocut-title">
+            <h2 id="autocut-title">Auto-cut</h2>
+            {autoCut.kind === "running" && (
+              <>
+                <p>{autoCut.source}</p>
+                <p className="muted">{autoCut.stage}</p>
+                <progress max={1} value={autoCut.stage === "Rendering…" ? autoCut.progress : undefined} />
+                <p className="muted small-note">Transcription and rendering run on this Mac. Nothing is uploaded.</p>
+              </>
+            )}
+            {autoCut.kind === "done" && (
+              <>
+                <p className="success">Reel ready</p>
+                <dl>
+                  <dt>Length</dt>
+                  <dd>
+                    {formatTime(autoCut.result.durationSec)} (from {formatTime(autoCut.result.sourceDurationSec)})
+                  </dd>
+                  <dt>Removed</dt>
+                  <dd>
+                    {plural(autoCut.result.pausesRemoved, "pause")} · {plural(autoCut.result.fillersRemoved, "filler")} ·{" "}
+                    {plural(autoCut.result.repeatsRemoved, "repeat")}
+                  </dd>
+                  <dt>Captions</dt><dd>{autoCut.result.captions}</dd>
+                  <dt>Check</dt>
+                  <dd>{Math.round(autoCut.result.keptWordsMatch * 100)}% of kept words heard in the result</dd>
+                </dl>
+                <div className="btn-row">
+                  <button className="btn primary" onClick={() => addResultToMedia(autoCut.result.outputPath)}>
+                    Add to media & preview
+                  </button>
+                  <button className="btn" onClick={() => revealItemInDir(autoCut.result.outputPath)}>Show in Finder</button>
+                  <button className="btn" onClick={() => setAutoCut({ kind: "idle" })}>Close</button>
+                </div>
+              </>
+            )}
+            {autoCut.kind === "error" && (
+              <>
+                <p className="errors" role="alert">{autoCut.message}</p>
+                <div className="btn-row">
+                  <button className="btn" onClick={() => setAutoCut({ kind: "idle" })}>Close</button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {settingsOpen && (
         <div className="modal-backdrop" onClick={(e) => e.target === e.currentTarget && closeSettings()}>

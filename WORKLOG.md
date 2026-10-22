@@ -28,6 +28,25 @@ Gate: MET - safe path + feasible toolchain.
 ## M1 - Desktop shell + real media import (DONE 2026-10-22)
 Gate MET: owner opened the debug .app, imported test-media/clip-a.mp4 by hand, confirmed preview playback
   and properties (1280x720, h264, 30 fps, audio) - owner-reported, not automated.
+## M8a - Free "Auto-cut" button, rules only, no AI (DONE 2026-10-22)
+Owner chose to build the free automatic path first (Claude Pro does not include API credit).
+- src-tauri/src/autoplan.rs: rules-based EditPlan from the transcript: pauses > 0.4s, fillers
+  (um/uh/uhm/umm/ah/er/erm/hmm/mm; NOT ano/parang), repeats/false starts (phrase of 1-4 words restarted
+  within 3 words keeps the last attempt; single words need >= 2 letters), captions <= 4 words / 26 chars
+  breaking at punctuation. Mixed gaps split into separate filler/repeat removals. Same validator/render.
+- autoedit::auto_cut + CLI `autoedit autocut <video>`; Tauri command `auto_cut` (projects in
+  ~/Movies/AI Reel Maker/, emits autocut-stage/autocut-progress, allows preview of the output).
+- UI: properties panel "Auto-cut (free, no AI)" -> modal with steps/progress -> result (length, removed
+  counts, captions, kept-words check) -> "Add to media & preview" / Show in Finder.
+Results (actual):
+- cargo test --lib 38/38 (4 new autoplan tests incl. validator round-trip); npm test 8/8; build OK.
+- CLI on clip-speech.mp4: removed 5 pauses, "um", first "how to make,", "strong coffee, strong cough."
+  -> 17.77s 1080x1920; output words: "how to make" x1, "strong" x1, no um/cough; verify 41/41 PASS.
+- In-app via computer use: import clip-speech -> Auto-cut -> "Reel ready 0:17.77 (from 0:28.85), 5 pauses,
+  1 filler, 2 repeats, 21 captions, 92%" -> Add to media -> played in-app (2s: "Today I'm going to").
+  ~/Movies/AI Reel Maker/1792674540-clip-speech/output.mp4 verify 41/41 PASS. Source checksums OK.
+Limits: no reordering/hook choice (AI-only); Tagalog fillers not removed; tested on synthetic EN-voice clip.
+
 ## M7 - One approved Claude planning call (IN PROGRESS - BLOCKED on API key)
 Owner approved: show request.json + free count_tokens, then ONE claude-opus-5-5 call; budget max 3 calls, < $1.
 Built (uncommitted until M7 passes): src-tauri/src/api.rs - HTTPS client (ureq; no official Rust SDK),

@@ -197,6 +197,28 @@ pub fn render_plan(dir: &Path, plan_path: &Path, on_progress: impl Fn(f64)) -> R
     Ok(report)
 }
 
+/// Free, offline one-shot: transcribe -> rules-based plan (no AI) -> validate -> render -> check.
+/// `stage` reports human-readable steps; `on_progress` is render progress (0-1).
+pub fn auto_cut(
+    video: &str,
+    root: &Path,
+    language: &str,
+    stage: impl Fn(&str),
+    on_progress: impl Fn(f64),
+) -> Result<(PathBuf, RenderReport), String> {
+    stage("Transcribing…");
+    let dir = prepare(video, root, language, &PlanSettings::default(), plan::DEFAULT_MODEL)?;
+    stage("Planning cuts…");
+    let t: Transcript = read_json(&dir.join("transcript.json"))?;
+    let edit = crate::autoplan::auto_plan(&t);
+    let plan_path = dir.join("plan.autocut.json");
+    write_json(&plan_path, &edit)?;
+    log(&dir, &format!("auto-cut plan (rules, no AI): {} segments, {} removals, {} captions", edit.segments.len(), edit.removals.len(), edit.captions.len()));
+    stage("Rendering…");
+    let report = render_plan(&dir, &plan_path, on_progress)?;
+    Ok((dir, report))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

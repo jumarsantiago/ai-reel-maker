@@ -4,6 +4,7 @@
 //!   autoedit render  <project_dir> <plan.json>
 //!   autoedit count   <project_dir>                 (free token count; sends request.json)
 //!   autoedit plan    <project_dir>                 (ONE paid call, budget-gated)
+//!   autoedit autocut <video> [--lang auto]         (free, no AI: rules-based cut + render)
 
 use ai_reel_maker_lib::{api, autoedit, plan};
 use std::path::Path;
@@ -89,6 +90,23 @@ fn main() -> ExitCode {
             }
         }),
         Some("plan") if args.len() >= 3 => paid_plan(Path::new(&args[2])),
+        Some("autocut") if args.len() >= 3 => {
+            let lang = opt(&args, "--lang").unwrap_or_else(|| "auto".into());
+            let root = opt(&args, "--root").unwrap_or_else(|| "projects".into());
+            std::fs::canonicalize(&args[2])
+                .map_err(|e| format!("{}: {e}", args[2]))
+                .and_then(|v| {
+                    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+                    let r = std::fs::canonicalize(&root).map_err(|e| e.to_string())?;
+                    autoedit::auto_cut(&v.to_string_lossy(), &r, &lang, |s| eprintln!("{s}"), |f| eprint!("\rrendering {:>3.0}%", f * 100.0))
+                })
+                .map(|(dir, r)| {
+                    eprintln!();
+                    println!("project: {}", dir.display());
+                    println!("output: {} ({:.2}s, {}x{})", r.output.output_path, r.output.duration_sec, r.output.width, r.output.height);
+                    println!("segments {} | captions {} | kept-words match {:.0}% | fillers in output: {:?}", r.segments, r.captions, r.kept_words_match * 100.0, r.filler_words_in_output);
+                })
+        }
         _ => Err("usage:\n  autoedit prepare <video> [--lang auto] [--root projects] [--model ID] [--min S] [--max S]\n  autoedit render <project_dir> <plan.json>".into()),
     };
     match result {

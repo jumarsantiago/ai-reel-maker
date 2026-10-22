@@ -62,6 +62,44 @@ pub struct Plan {
     pub fit: Fit,
     pub overlays: Vec<Overlay>,
     pub style: Style,
+    /// Quick, lower-quality encode for previews.
+    pub fast: bool,
+}
+
+impl Plan {
+    /// The first `max_sec` seconds of this plan (for a quick preview): later clips are dropped, the last
+    /// kept clip is shortened, and overlays and sound effects past the end are removed or cut short.
+    pub fn truncated(&self, max_sec: f64) -> Plan {
+        let mut p = self.clone();
+        let xf = xfade_sec(self);
+        let mut segs = Vec::new();
+        let mut acc = 0.0;
+        for (i, s) in self.segments.iter().enumerate() {
+            let overlap = if i > 0 { xf } else { 0.0 };
+            let room = max_sec - acc + overlap;
+            if room < MIN_SEGMENT_SEC + overlap {
+                break;
+            }
+            let mut s2 = s.clone();
+            s2.length = s2.length.min(room);
+            acc += s2.length - overlap;
+            segs.push(s2);
+            if acc >= max_sec - 1e-6 {
+                break;
+            }
+        }
+        p.segments = segs;
+        let end = plan_total(&p);
+        p.overlays.retain(|o| o.start < end - 0.05);
+        for o in &mut p.overlays {
+            o.end = o.end.min(end);
+        }
+        if let Some(fx) = &mut p.style.sfx {
+            fx.times.retain(|t| *t < end - 0.1);
+        }
+        p.fast = true;
+        p
+    }
 }
 
 /// Optional "reel" styling; all off by default so plain exports are unchanged.
@@ -82,8 +120,8 @@ pub struct Style {
     pub transition: Option<Transition>,
     /// Music plays at a steady level instead of being ducked by the clips' own sound (b-roll).
     pub music_no_duck: bool,
-    /// Level of the clips' own sound when music plays under it without ducking.
-    pub natural_gain_db: f64,
+    /// Volume of the clips' own sound, 0.0 (muted) to 1.0 (as recorded). `None` = unchanged.
+    pub video_volume: Option<f64>,
     /// Fade the picture and sound in at the start and out at the end (seconds, 0 = none).
     pub fade_sec: f64,
 }
@@ -146,6 +184,15 @@ pub struct Sfx {
 pub struct Music {
     pub path: PathBuf,
     pub gain_db: f64,
+    /// Where in the song to start (seconds).
+    pub start_sec: f64,
+    /// Fade the music in over 1s and out over 2s.
+    pub fade: bool,
+}
+
+/// Linear volume (0..1) as decibels for FFmpeg's `volume` filter; 0 becomes a very large cut.
+pub fn volume_db(v: f64) -> f64 {
+    if v <= 0.0001 { -90.0 } else { 20.0 * v.min(4.0).log10() }
 }
 
 /// How each clip fills the output frame.
@@ -282,6 +329,7 @@ pub fn plan_segments(
         fit: Fit::Pad,
         overlays: Vec::new(),
         style: Style::default(),
+        fast: false,
     })
 }
 
@@ -386,7 +434,8 @@ pub fn build_filter_graph(plan: &Plan) -> String {
     let vfade = if fade > 0.05 { format!("fade=t=in:st=0:d={f:.2},fade=t=out:st={o:.3}:d={f:.2}", f = fade, o = total - fade) } else { String::new() };
     let video_out = if plan.overlays.is_empty() && vfade.is_empty() { "[outv]" } else { "[cv]" };
     let sfx_times = plan.style.sfx.as_ref().map(|x| x.times.as_slice()).unwrap_or(&[]);
-    let audio_post = any_audio && (plan.style.music.is_some() || !sfx_times.is_empty() || plan.style.loudnorm || fade > 0.05);
+    let audio_post = any_audio
+        && (plan.style.music.is_some() || !sfx_times.is_empty() || plan.style.loudnorm || fade > 0.05 || plan.style.video_volume.is_some());
     let audio_out = if audio_post { "[ca]" } else { "[outa]" };
     if xf > 0.0 {
         // Crossfade every junction: overlapping video (xfade) and audio (acrossfade).
@@ -439,31 +488,49 @@ pub fn build_filter_graph(plan: &Plan) -> String {
     }
     if audio_post {
         let fmt = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
+        let loudnorm = "loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000";
         let mut idx = n + plan.overlays.len();
         let mut mix: Vec<String> = Vec::new();
+        // The clips' own sound: levelled to -14 LUFS first (so the music volume below is relative to the
+        // voice, not to whatever the camera recorded), then set to the chosen volume.
+        let mut chain: Vec<String> = Vec::new();
+        if plan.style.loudnorm {
+            chain.push(loudnorm.into());
+        }
+        if let Some(v) = plan.style.video_volume {
+            chain.push(format!("volume={:.1}dB", volume_db(v)));
+        }
+        let video_label = if chain.is_empty() {
+            "ca".to_string()
+        } else {
+            graph += &format!(";[ca]{}[cav]", chain.join(","));
+            "cav".to_string()
+        };
         if let Some(m) = &plan.style.music {
-            if plan.style.music_no_duck {
-                // B-roll: the clips' own sound sits under steady music; nothing ducks the music.
-                graph += &format!(
-                    ";[ca]volume={n:.1}dB[sp];[{idx}:a:0]{fmt},atrim=duration={t},volume={g:.1}dB[duck]",
-                    n = plan.style.natural_gain_db,
-                    t = secs(total),
-                    g = m.gain_db
-                );
+            let mut mus = format!("[{idx}:a:0]{fmt},atrim=duration={t}", t = secs(total));
+            if m.fade && total > 4.0 {
+                mus += &format!(",afade=t=in:st=0:d=1,afade=t=out:st={o:.3}:d=2", o = total - 2.0);
+            }
+            if plan.style.loudnorm {
+                mus += &format!(",{loudnorm}");
+            }
+            mus += &format!(",volume={g:.1}dB", g = m.gain_db);
+            let muted = plan.style.video_volume.is_some_and(|v| v <= 0.0001);
+            if plan.style.music_no_duck || muted {
+                // Steady music: b-roll, or nothing to duck under.
+                graph += &format!(";{mus}[duck]");
+                mix.push(video_label);
             } else {
                 // Music is ducked by the speech (sidechain), then mixed under it.
                 graph += &format!(
-                    ";[ca]asplit=2[sp][sc];[{idx}:a:0]{fmt},atrim=duration={t},volume={g:.1}dB[mus];\
-                     [mus][sc]sidechaincompress=threshold=0.02:ratio=12:attack=10:release=400[duck]",
-                    t = secs(total),
-                    g = m.gain_db
+                    ";[{video_label}]asplit=2[sp][sc];{mus}[mus];[mus][sc]sidechaincompress=threshold=0.02:ratio=12:attack=10:release=400[duck]"
                 );
+                mix.push("sp".into());
             }
-            mix.push("sp".into());
             mix.push("duck".into());
             idx += 1;
         } else {
-            mix.push("ca".into());
+            mix.push(video_label);
         }
         if let Some(fx) = plan.style.sfx.as_ref().filter(|x| !x.times.is_empty()) {
             let k = fx.times.len();
@@ -476,7 +543,8 @@ pub fn build_filter_graph(plan: &Plan) -> String {
                 mix.push(format!("d{j}"));
             }
         }
-        let base = if plan.style.loudnorm { "loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000" } else { "anull" };
+        // Everything is already levelled, so the mix only needs a limiter to stop peaks from clipping.
+        let base = if plan.style.loudnorm { "alimiter=limit=0.89:level=false" } else { "anull" };
         let finish = if fade > 0.05 {
             format!("{base},afade=t=in:st=0:d={f:.2},afade=t=out:st={o:.3}:d={f:.2}", f = fade, o = total - fade)
         } else {
@@ -510,7 +578,11 @@ pub fn build_ffmpeg_args(plan: &Plan, output: &Path) -> Vec<OsString> {
     }
     let any_audio = has_audio_track(plan);
     if let (true, Some(m)) = (any_audio, &plan.style.music) {
-        args.extend(["-stream_loop", "-1", "-i"].map(OsString::from));
+        args.extend(["-stream_loop", "-1"].map(OsString::from));
+        if m.start_sec > 0.0 {
+            args.extend(["-ss".into(), secs(m.start_sec).into()]);
+        }
+        args.push("-i".into());
         args.push(m.path.clone().into_os_string());
     }
     if let (true, Some(fx)) = (any_audio, plan.style.sfx.as_ref().filter(|x| !x.times.is_empty())) {
@@ -530,8 +602,9 @@ pub fn build_ffmpeg_args(plan: &Plan, output: &Path) -> Vec<OsString> {
     } else {
         args.push("-an".into());
     }
+    let (preset, crf) = if plan.fast { ("ultrafast", "28") } else { ("veryfast", "20") };
     args.extend(
-        ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y"]
+        ["-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y"]
             .map(OsString::from),
     );
     args.push(output.as_os_str().to_owned());
@@ -743,9 +816,9 @@ mod tests {
             pan: true,
             grade: Grade::Warm,
             transition: Some(Transition { style: TransitionStyle::Smooth, sec: 0.4 }),
-            music: Some(Music { path: "/m/song.mp3".into(), gain_db: -16.0 }),
+            music: Some(Music { path: "/m/song.mp3".into(), gain_db: -16.0, start_sec: 0.0, fade: false }),
             music_no_duck: true,
-            natural_gain_db: -9.0,
+            video_volume: Some(0.35),
             fade_sec: 0.5,
             ..Default::default()
         };
@@ -757,8 +830,9 @@ mod tests {
         assert!(g.contains("[x1][v2]xfade=transition=fade:duration=0.400:offset=3.200[cv];"), "{g}");
         assert!(g.contains("[a0][a1]acrossfade=d=0.400"));
         assert!(g.contains(";[cv]fade=t=in:st=0:d=0.50,fade=t=out:st=4.700:d=0.50,format=yuv420p[outv]"), "{g}");
-        // total = 6 - 2 * 0.4 = 5.2s; music steady (no sidechain), natural sound lowered.
-        assert!(g.contains("[ca]volume=-9.0dB[sp]") && !g.contains("sidechaincompress"));
+        // total = 6 - 2 * 0.4 = 5.2s; music steady (no sidechain), natural sound lowered to 35%.
+        assert!(g.contains(";[ca]volume=-9.1dB[cav]") && !g.contains("sidechaincompress"), "{g}");
+        assert!(g.contains("[cav][duck]amix=inputs=2"), "{g}");
         assert!(g.contains("afade=t=out:st=4.700:d=0.50"));
         assert!((plan_total(&plan) - 5.2).abs() < 1e-9);
     }
@@ -792,7 +866,7 @@ mod tests {
     #[test]
     fn music_alone_gives_silent_clips_an_audio_track() {
         let mut plan = plan_segments(&[seg("/v/b.mp4", 0.0, 2.0)], fake_probe).unwrap();
-        plan.style.music = Some(Music { path: "/m/song.mp3".into(), gain_db: -16.0 });
+        plan.style.music = Some(Music { path: "/m/song.mp3".into(), gain_db: -16.0, start_sec: 0.0, fade: false });
         let g = build_filter_graph(&plan);
         assert!(g.contains("anullsrc") && g.contains("[outa]"), "{g}");
     }
@@ -852,7 +926,7 @@ mod tests {
         plan.style = Style {
             zoom: vec![1.0, 1.15],
             sfx: Some(Sfx { path: "/fx/whoosh.wav".into(), times: vec![1.9], gain_db: -12.0 }),
-            music: Some(Music { path: "/m/song.mp3".into(), gain_db: -18.0 }),
+            music: Some(Music { path: "/m/song.mp3".into(), gain_db: -18.0, start_sec: 0.0, fade: false }),
             loudnorm: true,
             ..Default::default()
         };
@@ -862,15 +936,17 @@ mod tests {
         assert!(g.contains("crop=1080:1920,scale=1242:2208,crop=1080:1920,setsar=1"));
         assert!(g.contains("concat=n=2:v=1:a=1[cv][ca]"));
         // Inputs: 2 segments, 1 overlay (idx 2), music (idx 3), sfx (idx 4).
-        assert!(g.contains("[3:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration=3.000,volume=-18.0dB[mus]"));
+        // The voice is levelled first, then the music is levelled and set 18 dB under it, then ducked.
+        assert!(g.contains(";[ca]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[cav];[cav]asplit=2[sp][sc]"), "{g}");
+        assert!(g.contains("[3:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration=3.000,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000,volume=-18.0dB[mus]"), "{g}");
         assert!(g.contains("[mus][sc]sidechaincompress"));
         assert!(g.contains("[4:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=-12.0dB,anull[s0]"));
         assert!(g.contains("[s0]adelay=delays=1900:all=1[d0]"));
-        assert!(g.ends_with("[sp][duck][d0]amix=inputs=3:duration=first:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[outa]"));
+        assert!(g.ends_with("[sp][duck][d0]amix=inputs=3:duration=first:normalize=0,alimiter=limit=0.89:level=false[outa]"), "{g}");
         let args: Vec<String> = build_ffmpeg_args(&plan, Path::new("/o.mp4")).into_iter().map(|a| a.to_string_lossy().into_owned()).collect();
         let inputs: Vec<&String> = args.windows(2).filter(|w| w[0] == "-i").map(|w| &w[1]).collect();
         assert_eq!(inputs, ["/v/a.mp4", "/v/a.mp4", "/p/0.png", "/m/song.mp3", "/fx/whoosh.wav"]);
-        assert!(args.windows(3).any(|w| w[0] == "-stream_loop" && w[1] == "-1" && w[2] == "-i"));
+        assert!(args.windows(3).any(|w| w[0] == "-stream_loop" && w[1] == "-1" && w[2] == "-i"), "no -ss when the song starts at 0");
     }
 
     #[test]
@@ -879,7 +955,43 @@ mod tests {
         let plain = build_filter_graph(&plan);
         assert!(plain.ends_with("concat=n=1:v=1:a=1[outv][outa]"));
         plan.style.loudnorm = true;
-        assert!(build_filter_graph(&plan).ends_with("concat=n=1:v=1:a=1[outv][ca];[ca]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[outa]"));
+        let g = build_filter_graph(&plan);
+        assert!(g.ends_with("concat=n=1:v=1:a=1[outv][ca];[ca]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[cav];[cav]alimiter=limit=0.89:level=false[outa]"), "{g}");
+    }
+
+    #[test]
+    fn truncated_plan_keeps_only_the_first_seconds() {
+        let mut plan = plan_segments(&[seg("/v/a.mp4", 0.0, 4.0), seg("/v/a.mp4", 0.0, 4.0), seg("/v/a.mp4", 0.0, 4.0)], fake_probe).unwrap();
+        plan.overlays = vec![
+            Overlay { image: "/p/a.png".into(), start: 1.0, end: 2.0, y_center_frac: 0.7 },
+            Overlay { image: "/p/b.png".into(), start: 5.5, end: 7.0, y_center_frac: 0.7 },
+            Overlay { image: "/p/c.png".into(), start: 9.0, end: 10.0, y_center_frac: 0.7 },
+        ];
+        let p = plan.truncated(6.0);
+        assert_eq!(p.segments.len(), 2);
+        assert!((plan_total(&p) - 6.0).abs() < 1e-9);
+        assert_eq!(p.overlays.len(), 2);
+        assert_eq!(p.overlays[1].end, 6.0);
+        assert!(p.fast && !plan.fast);
+        let args: Vec<String> = build_ffmpeg_args(&p, Path::new("/o.mp4")).into_iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.windows(2).any(|w| w[0] == "-preset" && w[1] == "ultrafast"));
+        // With crossfades the overlap is accounted for, so the preview is still exactly the asked length.
+        plan.style.transition = Some(Transition { style: TransitionStyle::Smooth, sec: 0.5 });
+        assert!((plan_total(&plan.truncated(6.0)) - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn music_volume_mute_start_and_fade() {
+        let mut plan = plan_segments(&[seg("/v/a.mp4", 0.0, 5.0)], fake_probe).unwrap();
+        plan.style.music = Some(Music { path: "/m/song.mp3".into(), gain_db: volume_db(0.5), start_sec: 12.5, fade: true });
+        plan.style.video_volume = Some(0.0);
+        let g = build_filter_graph(&plan);
+        assert!(g.contains(";[ca]volume=-90.0dB[cav]"), "muted video: {g}");
+        assert!(g.contains("afade=t=in:st=0:d=1,afade=t=out:st=3.000:d=2"), "{g}");
+        assert!(g.contains("volume=-6.0dB[duck]") && !g.contains("sidechaincompress"), "muted video: nothing to duck under: {g}");
+        let args: Vec<String> = build_ffmpeg_args(&plan, Path::new("/o.mp4")).into_iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.windows(5).any(|w| w[0] == "-stream_loop" && w[1] == "-1" && w[2] == "-ss" && w[3] == "12.500" && w[4] == "-i"), "{args:?}");
+        assert!((volume_db(1.0)).abs() < 1e-9 && volume_db(0.0) == -90.0);
     }
 
     #[test]

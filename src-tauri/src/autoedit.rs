@@ -150,6 +150,64 @@ pub struct EditStyle {
     /// Caption font file chosen in the app (a system or user font); `None` = the built-in rounded font.
     #[serde(default)]
     pub caption_font: Option<String>,
+    #[serde(flatten)]
+    pub audio: AudioMix,
+    /// Draw the captions into the video (true), or leave them out and rely on the .srt (for CapCut).
+    #[serde(default = "default_true")]
+    pub burn_captions: bool,
+    /// Also render the other shape (vertical and horizontal from one edit).
+    #[serde(default)]
+    pub both_shapes: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Sound settings shared by Auto Edit and Travel mode (the "CapCut" volume controls).
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AudioMix {
+    /// Music level, 0.0-1.0, relative to the levelled voice (1.0 = as loud as the voice).
+    pub music_volume: f64,
+    /// The video's own sound, 0.0-1.0.
+    pub video_volume: f64,
+    /// Silence the video's own sound completely.
+    pub mute_video: bool,
+    /// Lower the music while someone talks.
+    pub duck_music: bool,
+    /// Fade the music in at the start and out at the end.
+    pub music_fade: bool,
+    /// Where in the song to start, in seconds.
+    pub music_start_sec: f64,
+}
+
+impl Default for AudioMix {
+    fn default() -> Self {
+        Self { music_volume: 0.2, video_volume: 1.0, mute_video: false, duck_music: true, music_fade: true, music_start_sec: 0.0 }
+    }
+}
+
+impl AudioMix {
+    /// The clips' own sound volume for the renderer (`None` when it is left exactly as recorded).
+    pub fn video_volume(&self) -> Option<f64> {
+        if self.mute_video {
+            Some(0.0)
+        } else if (self.video_volume - 1.0).abs() > 0.005 {
+            Some(self.video_volume.clamp(0.0, 2.0))
+        } else {
+            None
+        }
+    }
+
+    pub fn music(&self, path: PathBuf) -> render::Music {
+        render::Music {
+            path,
+            gain_db: render::volume_db(self.music_volume.clamp(0.0, 2.0)),
+            start_sec: self.music_start_sec.max(0.0),
+            fade: self.music_fade,
+        }
+    }
 }
 
 fn default_soft_captions() -> bool {
@@ -158,20 +216,19 @@ fn default_soft_captions() -> bool {
 
 impl Default for EditStyle {
     fn default() -> Self {
-        Self { zoom: true, sound_effects: true, highlight_words: true, soft_captions: true, loudness: true, music: None, orientation: Orientation::Vertical, fit_blur: false, caption_template: CaptionTemplate::Soft, caption_font: None }
+        Self { zoom: true, sound_effects: true, highlight_words: true, soft_captions: true, loudness: true, music: None, orientation: Orientation::Vertical, fit_blur: false, caption_template: CaptionTemplate::Soft, caption_font: None, audio: AudioMix::default(), burn_captions: true, both_shapes: false }
     }
 }
 
 impl EditStyle {
     pub fn plain() -> Self {
-        Self { zoom: false, sound_effects: false, highlight_words: false, soft_captions: false, loudness: false, music: None, orientation: Orientation::Vertical, fit_blur: false, caption_template: CaptionTemplate::Soft, caption_font: None }
+        Self { zoom: false, sound_effects: false, highlight_words: false, soft_captions: false, loudness: false, music: None, orientation: Orientation::Vertical, fit_blur: false, caption_template: CaptionTemplate::Soft, caption_font: None, audio: AudioMix::default(), burn_captions: true, both_shapes: false }
     }
 }
 
 pub const PUNCH_IN: f64 = 1.15;
 const SFX_GAIN_DB: f64 = -14.0;
 const SFX_LEAD_SEC: f64 = 0.15;
-const MUSIC_GAIN_DB: f64 = -16.0;
 pub const MUSIC_EXTENSIONS: &[&str] = &["mp3", "m4a", "aac", "wav", "aif", "aiff", "flac"];
 
 /// Self-made whoosh (filtered pink noise), generated once locally - no third-party audio.
@@ -261,8 +318,19 @@ struct StyleRecord<'a> {
 }
 
 /// Local step 2: validate a plan (from Claude, a fixture or Auto-cut) and render the vertical MP4.
-pub fn render_plan(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: impl Fn(f64)) -> Result<RenderReport, String> {
-    let dir = &std::fs::canonicalize(dir).map_err(|e| format!("Project folder {}: {e}", dir.display()))?;
+/// Everything needed to render a project: the validated plan and the FFmpeg plan with captions drawn.
+struct Built {
+    plan: Plan,
+    v: ValidatedPlan,
+    settings: ProjectSettings,
+    source: PathBuf,
+    srt: Option<PathBuf>,
+}
+
+/// Validates the plan and draws the captions and extras into `cap_folder`. Only a `main` build records the
+/// validated plan, SRT and style; previews and second-shape renders leave them alone.
+fn build_render(dir: &Path, plan_path: &Path, look: &EditStyle, main: bool, cap_folder: &str) -> Result<Built, String> {
+    let preview = !main;
     let info: MediaInfo = read_json(&dir.join("source.json"))?;
     let t: Transcript = read_json(&dir.join("transcript.json"))?;
     let settings: ProjectSettings = read_json(&dir.join("settings.json"))?;
@@ -278,11 +346,13 @@ pub fn render_plan(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: 
             return Err(format!("Plan rejected:\n- {}", errors.join("\n- ")));
         }
     };
-    write_json(&dir.join("plan.validated.json"), &v)?;
+    if !preview {
+        write_json(&dir.join("plan.validated.json"), &v)?;
+    }
     log(dir, &format!("plan valid: {} segments, {} captions, {:.2}s", v.segments.len(), v.captions.len(), v.total_sec));
 
     // Captions -> PNGs (one per highlighted word, or one per caption) + SRT.
-    let cap_dir = dir.join("captions");
+    let cap_dir = dir.join(cap_folder);
     if cap_dir.exists() {
         std::fs::remove_dir_all(&cap_dir).map_err(|e| e.to_string())?; // our own generated PNGs only
     }
@@ -303,7 +373,9 @@ pub fn render_plan(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: 
         (false, false) => CaptionStyle::for_width(short),
     };
     let mut overlays = Vec::new();
-    for (i, c) in v.captions.iter().enumerate() {
+    // "Captions for CapCut": the words go only into the .srt, so they can be styled in the editor.
+    let burned: &[crate::plan::ValidCaption] = if look.burn_captions { &v.captions } else { &[] };
+    for (i, c) in burned.iter().enumerate() {
         if look.highlight_words {
             for (k, (a, b)) in caption_word_times(c, &v, &t).into_iter().enumerate() {
                 if b - a < 0.01 {
@@ -328,8 +400,13 @@ pub fn render_plan(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: 
         let xfont = captions::load_font_choice(look.caption_font.as_deref(), captions::SOFT_FONT)?;
         overlays.extend(crate::extras::overlays(&xfont, &placed, look.orientation, &cap_dir)?);
     }
-    let srt_path = next_free(dir, "output", "srt");
-    std::fs::write(&srt_path, captions::to_srt(&v.captions)).map_err(|e| e.to_string())?;
+    let srt = if preview {
+        None
+    } else {
+        let srt_path = next_free(dir, "output", "srt");
+        std::fs::write(&srt_path, captions::to_srt(&v.captions)).map_err(|e| e.to_string())?;
+        Some(srt_path)
+    };
 
     let zoom: Vec<f64> = (0..v.segments.len()).map(|k| if look.zoom && k % 2 == 1 { PUNCH_IN } else { 1.0 }).collect();
     let sfx_times: Vec<f64> = if look.sound_effects {
@@ -342,7 +419,9 @@ pub fn render_plan(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: 
     } else {
         Some(render::Sfx { path: whoosh_path()?, times: sfx_times.clone(), gain_db: SFX_GAIN_DB })
     };
-    write_json(&dir.join("style.json"), &StyleRecord { style: look, zoom_per_segment: zoom.clone(), sfx_times })?;
+    if !preview {
+        write_json(&dir.join("style.json"), &StyleRecord { style: look, zoom_per_segment: zoom.clone(), sfx_times })?;
+    }
 
     let source = PathBuf::from(&info.path);
     let fps = info.fps.round() as u32;
@@ -367,11 +446,22 @@ pub fn render_plan(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: 
         style: render::Style {
             zoom,
             sfx,
-            music: music.map(|path| render::Music { path, gain_db: MUSIC_GAIN_DB }),
+            music: music.map(|path| look.audio.music(path)),
+            video_volume: look.audio.video_volume(),
+            music_no_duck: !look.audio.duck_music,
             loudnorm: look.loudness,
             ..Default::default()
         },
+        fast: false,
     };
+    Ok(Built { plan: render_plan, v, settings, source, srt })
+}
+
+/// Renders a project (plan -> captions -> FFmpeg), then re-transcribes the result as an independent check.
+pub fn render_plan(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: impl Fn(f64)) -> Result<RenderReport, String> {
+    let dir = &std::fs::canonicalize(dir).map_err(|e| format!("Project folder {}: {e}", dir.display()))?;
+    let Built { plan: render_plan, v, settings, source, srt } = build_render(dir, plan_path, look, true, "captions")?;
+    let srt_path = srt.expect("full build writes an SRT");
     let out_path = next_free(dir, "output", "mp4");
     let out = render::validate_output_path(&out_path.to_string_lossy(), &[source], false)?;
     let result = render::render_to(&render_plan, &out, false, on_progress)?;
@@ -397,6 +487,72 @@ pub fn render_plan(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: 
     write_json(&dir.join("render_report.json"), &report)?;
     log(dir, &format!("kept-words match {:.0}%", report.kept_words_match * 100.0));
     Ok(report)
+}
+
+/// Renders the same edit again in the other shape (vertical <-> horizontal) as `output-<shape>.mp4`,
+/// with captions and extras placed for that shape. No re-transcription check (the cut is identical).
+pub fn render_other_shape(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: impl Fn(f64)) -> Result<render::ExportResult, String> {
+    let dir = &std::fs::canonicalize(dir).map_err(|e| format!("Project folder {}: {e}", dir.display()))?;
+    let mut other = look.clone();
+    other.orientation = match look.orientation {
+        Orientation::Vertical => Orientation::Horizontal,
+        Orientation::Horizontal => Orientation::Vertical,
+    };
+    let name = match other.orientation {
+        Orientation::Vertical => "vertical",
+        Orientation::Horizontal => "horizontal",
+    };
+    let built = build_render(dir, plan_path, &other, false, &format!("captions-{name}"))?;
+    let out = next_free(dir, &format!("output-{name}"), "mp4");
+    let out = render::validate_output_path(&out.to_string_lossy(), &[built.source], false)?;
+    let result = render::render_to(&built.plan, &out, false, on_progress)?;
+    log(dir, &format!("rendered other shape {} ({:.2}s, {}x{})", result.output_path, result.duration_sec, result.width, result.height));
+    Ok(result)
+}
+
+/// A cover image for an Auto Edit project: the best moment of `video` (the rendered reel), taken from a quick
+/// render of the same edit without captions, hook or tags, so the title is not drawn over other text.
+pub fn project_thumbnail(dir: &Path, video: &Path, look: &EditStyle, text: Option<&str>) -> Result<PathBuf, String> {
+    let dir = &std::fs::canonicalize(dir).map_err(|e| format!("Project folder {}: {e}", dir.display()))?;
+    let t = crate::thumbnail::best_frame_time(video)?;
+    let mut clean = look.clone();
+    clean.burn_captions = false;
+    clean.music = None;
+    let mut built = build_render(dir, &dir.join("plan.autocut.json"), &clean, false, "thumbnail-captions")?;
+    built.plan.overlays.clear();
+    let plan = built.plan.truncated(t + 0.3);
+    let tmp = dir.join("thumbnail-frame.mp4");
+    let _ = std::fs::remove_file(&tmp); // our own previous work file
+    let tmp = render::validate_output_path(&tmp.to_string_lossy(), &[built.source], false)?;
+    let r = render::render_to(&plan, &tmp, false, |_| {})?;
+    let out = crate::thumbnail::next_thumbnail_path(video.parent().unwrap_or(dir));
+    let res = crate::thumbnail::grab_frame(&tmp, (r.duration_sec - 0.15).max(0.0).min(t), &out);
+    let _ = std::fs::remove_file(&tmp);
+    res?;
+    if let Some(text) = text.map(str::trim).filter(|t| !t.is_empty()) {
+        crate::thumbnail::add_title(&out, text, look.caption_font.as_deref())?;
+    }
+    Ok(out)
+}
+
+/// [`render_other_shape`] when the style asks for both shapes.
+pub fn other_shape_if_wanted(dir: &Path, look: &EditStyle, stage: impl Fn(&str), on_progress: impl Fn(f64)) -> Result<Option<render::ExportResult>, String> {
+    if !look.both_shapes {
+        return Ok(None);
+    }
+    stage("Rendering the other shape…");
+    render_other_shape(dir, &dir.join("plan.autocut.json"), look, on_progress).map(Some)
+}
+
+/// A quick, low-quality render of the first `seconds` of the reel, as `preview.mp4` in the project folder.
+pub fn render_preview(dir: &Path, plan_path: &Path, look: &EditStyle, seconds: f64, on_progress: impl Fn(f64)) -> Result<render::ExportResult, String> {
+    let dir = &std::fs::canonicalize(dir).map_err(|e| format!("Project folder {}: {e}", dir.display()))?;
+    let built = build_render(dir, plan_path, look, false, "preview-captions")?;
+    let plan = built.plan.truncated(seconds.clamp(3.0, 30.0));
+    let out = dir.join("preview.mp4");
+    let _ = std::fs::remove_file(&out); // our own previous preview
+    let out = render::validate_output_path(&out.to_string_lossy(), &[built.source], false)?;
+    render::render_to(&plan, &out, false, on_progress)
 }
 
 /// Free, offline one-shot: transcribe -> rules-based plan (no AI) -> validate -> styled render -> check.
@@ -446,7 +602,15 @@ pub fn auto_cut_prepare(
     write_extras(&dir, extras)?;
     stage("Planning cuts…");
     let t: Transcript = read_json(&dir.join("transcript.json"))?;
-    let edit = crate::autoplan::auto_plan(&t);
+    let mut edit = crate::autoplan::auto_plan(&t);
+    // The user's remembered spelling fixes.
+    if let Ok(app_dir) = crate::prefs::app_dir() {
+        let fixes = crate::dictionary::load(&app_dir);
+        let n = crate::dictionary::apply_to_plan(&mut edit, &fixes);
+        if n > 0 {
+            log(&dir, &format!("spelling dictionary fixed {n} caption(s)"));
+        }
+    }
     let plan_path = dir.join("plan.autocut.json");
     write_json(&plan_path, &edit)?;
     log(&dir, &format!("auto-cut plan (rules, no AI): {} segments, {} removals, {} captions", edit.segments.len(), edit.removals.len(), edit.captions.len()));
@@ -500,6 +664,19 @@ pub fn caption_drafts(dir: &Path) -> Result<Vec<CaptionDraft>, String> {
             let (a, b) = (c.start.max(seg.start), c.end.min(seg.end));
             Some(CaptionDraft { index, text: c.text.clone(), start: seg.out_start + (a - seg.start), end: seg.out_start + (b - seg.start) })
         })
+        .collect())
+}
+
+/// Spelling fixes to remember from the user's caption edits (deleted captions teach nothing).
+pub fn learned_fixes(dir: &Path, edits: &[CaptionEdit]) -> Result<Vec<crate::dictionary::Fix>, String> {
+    let backup = dir.join("plan.autocut.original.json");
+    let path = if backup.exists() { backup } else { dir.join("plan.autocut.json") };
+    let original: EditPlan = read_json(&path)?;
+    Ok(edits
+        .iter()
+        .filter(|e| !e.deleted)
+        .filter_map(|e| original.captions.get(e.index).map(|c| crate::dictionary::learn(&c.text, &e.text)))
+        .flatten()
         .collect())
 }
 
@@ -616,6 +793,21 @@ mod tests {
         write_json(&dir.join("transcript.json"), &t).unwrap();
         write_json(&dir.join("plan.autocut.json"), &crate::autoplan::auto_plan(&t)).unwrap();
         (dir, t)
+    }
+
+    #[test]
+    fn review_edits_teach_spelling_fixes() {
+        let (dir, _) = project_with_transcript();
+        let drafts = caption_drafts(&dir).unwrap();
+        let first = &drafts[0];
+        let fixed = first.text.replacen("dali", "dalí", 1);
+        let edits = vec![
+            CaptionEdit { index: first.index, text: fixed.clone(), deleted: false },
+            CaptionEdit { index: drafts[1].index, text: String::new(), deleted: true },
+        ];
+        let learned = learned_fixes(&dir, &edits).unwrap();
+        assert_eq!(learned, vec![crate::dictionary::Fix { from: "dali".into(), to: "dalí".into() }], "{} -> {fixed}", first.text);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

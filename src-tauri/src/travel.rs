@@ -3,16 +3,14 @@
 //! look, and joined with crossfades or slides. Original sound is kept (quietly under optional music) so a voice-over
 //! can be added later in an editor. Hook / tags / CTA come from [`crate::extras`], same as Auto Edit.
 
-use crate::autoedit::{check_music, log};
+use crate::autoedit::{check_music, log, AudioMix};
 use crate::captions;
 use crate::extras::{self, Extras};
 use crate::media;
-use crate::render::{self, Fit, Grade, Music, Orientation, SegmentRequest, Style, Transition, TransitionStyle};
+use crate::render::{self, Fit, Grade, Orientation, SegmentRequest, Style, Transition, TransitionStyle};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-const MUSIC_GAIN_DB: f64 = -16.0;
-const NATURAL_GAIN_DB: f64 = -9.0;
 const TRANSITION_SEC: f64 = 0.45;
 const FADE_SEC: f64 = 0.6;
 
@@ -37,6 +35,15 @@ pub struct TravelStyle {
     pub fit: String,
     /// Font file for the hook, tags and CTA (a system or user font); `None` = built-in rounded font.
     pub font: Option<String>,
+    /// Music and video-sound volumes. B-roll sound defaults to a quiet bed under the music.
+    #[serde(flatten)]
+    pub audio: AudioMix,
+    /// Also render the other shape (vertical and horizontal).
+    pub both_shapes: bool,
+    /// Keep the sharpest, steadiest stretch of each clip instead of its middle.
+    pub smart_pick: bool,
+    /// Cut on the music's beat (needs music with a steady pulse).
+    pub beat_sync: bool,
 }
 
 impl Default for TravelStyle {
@@ -51,8 +58,43 @@ impl Default for TravelStyle {
             orientation: Orientation::Vertical,
             fit: "fill".into(),
             font: None,
+            audio: AudioMix { music_volume: 0.5, video_volume: 0.35, duck_music: false, ..AudioMix::default() },
+            both_shapes: false,
+            smart_pick: true,
+            beat_sync: false,
         }
     }
+}
+
+/// Where a `len`-second window should start inside `req` to get its sharpest, steadiest stretch: frames are
+/// scored for sharpness (focus) minus movement (shake), with a slight preference for the middle.
+pub fn best_start(req: &SegmentRequest, len: f64) -> Result<f64, String> {
+    let avail = req.out_point - req.in_point;
+    if len >= avail - 0.05 {
+        return Ok(req.in_point);
+    }
+    let info = media::probe(&req.source_path)?;
+    let fps = (80.0 / avail).clamp(0.5, 4.0);
+    let s = crate::frames::sample_gray(Path::new(&req.source_path), req.in_point, avail, fps, 96, info.width, info.height)?;
+    let n = s.frames.len();
+    let sharp: Vec<f64> = s.frames.iter().map(|f| crate::frames::sharpness(f, s.width, s.height)).collect();
+    let mut motion: Vec<f64> = (0..n).map(|i| if i == 0 { 0.0 } else { crate::frames::motion(&s.frames[i - 1], &s.frames[i]) }).collect();
+    if n > 1 {
+        motion[0] = motion[1];
+    }
+    let (ms, mm) = (sharp.iter().cloned().fold(1e-9, f64::max), motion.iter().cloned().fold(1e-9, f64::max));
+    let score: Vec<f64> = (0..n).map(|i| sharp[i] / ms - 0.6 * motion[i] / mm).collect();
+    let k = ((len * fps).round() as usize).clamp(1, n);
+    let mid = (n - k) as f64 / 2.0;
+    let best = (0..=n - k)
+        .map(|j| {
+            let mean = score[j..j + k].iter().sum::<f64>() / k as f64;
+            (j, mean - 0.1 * (j as f64 - mid).abs() / n as f64)
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(j, _)| j)
+        .unwrap_or(0);
+    Ok((req.in_point + best as f64 / fps).min(req.out_point - len))
 }
 
 /// Caps `req` to `cap` seconds, keeping the middle. `cap <= 0` leaves it alone.
@@ -90,12 +132,65 @@ pub fn travel_edit(
     stage: impl Fn(&str),
     on_progress: impl Fn(f64),
 ) -> Result<(PathBuf, render::ExportResult), String> {
+    travel_render(segments, root, style, extras, None, stage, on_progress)
+}
+
+/// A quick, low-quality render of the first `seconds` of the travel reel (in `root/previews/travel`).
+pub fn travel_preview(
+    segments: &[SegmentRequest],
+    root: &Path,
+    style: &TravelStyle,
+    extras: Option<&Extras>,
+    seconds: f64,
+    on_progress: impl Fn(f64),
+) -> Result<render::ExportResult, String> {
+    travel_render(segments, root, style, extras, Some(seconds.clamp(3.0, 30.0)), |_| {}, on_progress).map(|(_, r)| r)
+}
+
+fn travel_render(
+    segments: &[SegmentRequest],
+    root: &Path,
+    style: &TravelStyle,
+    extras: Option<&Extras>,
+    preview_sec: Option<f64>,
+    stage: impl Fn(&str),
+    on_progress: impl Fn(f64),
+) -> Result<(PathBuf, render::ExportResult), String> {
     if segments.is_empty() {
         return Err("Timeline is empty. Add clips with the + button first.".into());
     }
     let music = style.music.as_deref().map(check_music).transpose()?;
     stage(&format!("Preparing {} clip(s)…", segments.len()));
-    let reqs: Vec<SegmentRequest> = segments.iter().map(|s| capped(s, style.clip_sec)).collect();
+    // Beat sync: each clip lasts a whole number of beats (plus the crossfade overlap), and the song starts
+    // on a beat, so every cut lands on the music.
+    let grid = match (&music, style.beat_sync) {
+        (Some(m), true) => crate::beats::detect(m, style.audio.music_start_sec)?.filter(|g| g.confidence >= 0.1),
+        _ => None,
+    };
+    let mut transition = transition_of(&style.transition);
+    if let (Some(g), Some(t)) = (grid, transition.as_mut()) {
+        t.sec = t.sec.min(0.5 * g.period); // short enough that the renderer never has to shrink it
+    }
+    let xf = transition.map(|t| t.sec).unwrap_or(0.0);
+    let mut reqs: Vec<SegmentRequest> = Vec::with_capacity(segments.len());
+    for s in segments {
+        let avail = s.out_point - s.in_point;
+        let want = match grid {
+            Some(g) => {
+                let fit = ((avail - xf) / g.period).floor().max(1.0);
+                let beats = if style.clip_sec > 0.0 { (style.clip_sec / g.period).round().clamp(1.0, fit) } else { fit };
+                beats * g.period + xf
+            }
+            None if style.clip_sec > 0.0 => style.clip_sec,
+            None => avail,
+        };
+        if want >= avail - 0.01 {
+            reqs.push(s.clone());
+            continue;
+        }
+        let start = if style.smart_pick { best_start(s, want)? } else { s.in_point + (avail - want) / 2.0 };
+        reqs.push(SegmentRequest { source_path: s.source_path.clone(), in_point: start, out_point: start + want });
+    }
     let mut plan = render::plan_segments(&reqs, media::probe)?;
     let (width, height) = style.orientation.size();
     plan.width = width;
@@ -104,16 +199,29 @@ pub fn travel_edit(
     plan.style = Style {
         pan: style.pan,
         grade: grade_of(&style.grade),
-        transition: transition_of(&style.transition),
-        music: music.map(|path| Music { path, gain_db: MUSIC_GAIN_DB }),
-        music_no_duck: true,
-        natural_gain_db: NATURAL_GAIN_DB,
+        transition,
+        music: music.map(|path| {
+            let mut m = style.audio.music(path);
+            if let Some(g) = grid {
+                m.start_sec += g.phase; // the first beat at 0:00
+            }
+            m
+        }),
+        music_no_duck: !style.audio.duck_music,
+        video_volume: style.audio.video_volume(),
         fade_sec: if style.fade { FADE_SEC } else { 0.0 },
         ..Default::default()
     };
 
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let dir = root.join(format!("{secs}-travel"));
+    let dir = match preview_sec {
+        Some(_) => {
+            let d = root.join("previews").join("travel");
+            let _ = std::fs::remove_dir_all(&d); // our own previous preview
+            d
+        }
+        None => (1..).map(|n| if n == 1 { root.join(format!("{secs}-travel")) } else { root.join(format!("{secs}-travel-{n}")) }).find(|p| !p.exists()).expect("unbounded"),
+    };
     let cap_dir = dir.join("captions");
     std::fs::create_dir_all(&cap_dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
     let total = render::plan_total(&plan);
@@ -128,7 +236,15 @@ pub fn travel_edit(
     }
     std::fs::write(dir.join("style.json"), serde_json::to_string_pretty(style).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     log(&dir, &format!("travel: {} clips, {:.1}s, style {:?}", plan.segments.len(), total, style));
+    match (style.beat_sync, grid) {
+        (true, Some(g)) => log(&dir, &format!("beat sync: {:.1} BPM, first beat {:.2}s, confidence {:.2}", g.bpm(), g.phase, g.confidence)),
+        (true, None) => log(&dir, "beat sync: no steady beat found (or no music); cut by clip length instead"),
+        _ => {}
+    }
 
+    if let Some(sec) = preview_sec {
+        plan = plan.truncated(sec);
+    }
     stage("Rendering…");
     let sources: Vec<PathBuf> = plan.segments.iter().map(|s| s.path.clone()).collect();
     let out = render::validate_output_path(&dir.join("output.mp4").to_string_lossy(), &sources, false)?;
@@ -152,6 +268,53 @@ mod tests {
         let short = capped(&req(1.0, 3.0), 4.0);
         assert_eq!((short.in_point, short.out_point), (1.0, 3.0));
         assert_eq!(capped(&req(0.0, 60.0), 0.0).out_point, 60.0);
+    }
+
+    #[test]
+    fn smart_pick_avoids_the_blurry_shaky_part() {
+        let Some(ffmpeg) = media::find_tool("ffmpeg") else { return };
+        let dir = std::env::temp_dir().join(format!("arm-pick-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = dir.join("v.mp4");
+        // Sharp 0-5s, blurred 5-12s.
+        assert!(std::process::Command::new(&ffmpeg)
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25:duration=12",
+                   "-vf", "boxblur=enable='gte(t,5)':luma_radius=18:luma_power=3", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&v)
+            .status()
+            .unwrap()
+            .success());
+        let r = SegmentRequest { source_path: v.to_string_lossy().into_owned(), in_point: 0.0, out_point: 12.0 };
+        let s = best_start(&r, 4.0).unwrap();
+        assert!(s + 4.0 <= 5.6, "picked {s}..{} which runs into the blur", s + 4.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Beat sync with a 120 BPM click track: every clip is a whole number of beats plus the overlap.
+    #[test]
+    fn real_beat_synced_reel() {
+        let Some(ffmpeg) = media::find_tool("ffmpeg") else { return };
+        let dir = std::env::temp_dir().join(format!("arm-beatreel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = dir.join("v.mp4");
+        let m = dir.join("m.m4a");
+        assert!(std::process::Command::new(&ffmpeg)
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25:duration=20", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&v).status().unwrap().success());
+        assert!(std::process::Command::new(&ffmpeg)
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i", "aevalsrc=sin(2*PI*1200*t)*exp(-50*mod(t+5\\,0.5)):s=44100:d=30", "-c:a", "aac"])
+            .arg(&m).status().unwrap().success());
+        let s = |a: f64, b: f64| SegmentRequest { source_path: v.to_string_lossy().into_owned(), in_point: a, out_point: b };
+        let style = TravelStyle { music: Some(m.to_string_lossy().into_owned()), beat_sync: true, clip_sec: 3.0, ..Default::default() };
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let (proj, r) = travel_edit(&[s(0.0, 6.0), s(6.0, 12.0), s(12.0, 20.0)], &root, &style, None, |_| {}, |_| {}).unwrap();
+        let log = std::fs::read_to_string(proj.join("log.txt")).unwrap();
+        let bpm: f64 = log.split("beat sync: ").nth(1).and_then(|r| r.split(' ').next()).and_then(|x| x.parse().ok()).expect("beat sync line");
+        assert!((bpm - 120.0).abs() < 1.5, "{log}");
+        // 3 clips of 6 beats (3.0s) + 0.25s overlap each, minus two 0.25s crossfades = 9.25s.
+        assert!((r.duration_sec - 9.25).abs() < 0.2, "duration {}", r.duration_sec);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -201,6 +364,29 @@ mod tests {
         let (_, r) = travel_edit(&segs, &root, &style, Some(&ex), |_| {}, |_| {}).unwrap();
         assert_eq!((r.width, r.height), (1920, 1080));
         assert!((r.duration_sec - 5.55).abs() < 0.3, "duration {}", r.duration_sec);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_travel_preview_is_short_and_fast() {
+        let Some(ffmpeg) = media::find_tool("ffmpeg") else { return };
+        let dir = std::env::temp_dir().join(format!("arm-travel-p-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("long.mp4");
+        assert!(std::process::Command::new(&ffmpeg)
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25:duration=30", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&p)
+            .status()
+            .unwrap()
+            .success());
+        let s = |a: f64, b: f64| SegmentRequest { source_path: p.to_string_lossy().into_owned(), in_point: a, out_point: b };
+        let segs = vec![s(0.0, 6.0), s(6.0, 12.0), s(12.0, 18.0), s(18.0, 24.0)];
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let r = travel_preview(&segs, &root, &TravelStyle::default(), None, 6.0, |_| {}).unwrap();
+        assert!((r.duration_sec - 6.0).abs() < 0.25, "preview {}", r.duration_sec);
+        // A second preview replaces the first instead of failing on an existing file.
+        travel_preview(&segs, &root, &TravelStyle::default(), None, 6.0, |_| {}).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

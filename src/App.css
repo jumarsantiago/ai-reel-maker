@@ -91,3 +91,13 @@ dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; 
 .modal progress { width: 100%; accent-color: var(--accent); }
 .modal dl { margin-bottom: 4px; }
 .success { color: #5fd38d; font-weight: 600; }
+
+/* Settings */
+.topbar-actions { display: flex; gap: 8px; }
+.modal h3 { font-size: 14px; margin: 14px 0 8px; }
+.modal .key-status { white-space: normal; }
+.field { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; }
+.field input { background: #0f1115; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font: inherit; font-family: ui-monospace, Menlo, monospace; }
+.field input:focus-visible { outline: 2px solid var(--accent); }
+.modal .small { font-size: 12px; white-space: normal; margin-top: 12px; }
+.modal.settings .success, .modal.settings .errors { white-space: normal; font-family: inherit; }

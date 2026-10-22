@@ -28,6 +28,36 @@ Gate: MET - safe path + feasible toolchain.
 ## M1 - Desktop shell + real media import (DONE 2026-10-22)
 Gate MET: owner opened the debug .app, imported test-media/clip-a.mp4 by hand, confirmed preview playback
   and properties (1280x720, h264, 30 fps, audio) - owner-reported, not automated.
+## M7 - One approved Claude planning call (IN PROGRESS - BLOCKED on API key)
+Owner approved: show request.json + free count_tokens, then ONE claude-opus-5-5 call; budget max 3 calls, < $1.
+Built (uncommitted until M7 passes): src-tauri/src/api.rs - HTTPS client (ureq; no official Rust SDK),
+  key from env ANTHROPIC_API_KEY or Keychain service "ANTHROPIC_API_KEY" (read at call time, never logged),
+  count_tokens (free per live docs: "Token counting is free to use"), request_plan with ledger
+  projects/api_ledger.json (refuses call #4 or worst-case total > $1.00), response.json/plan.raw.json/
+  api_usage.json written per project. CLI: `autoedit count <dir>`, `autoedit plan <dir>`. cargo test 33/33.
+request.json reviewed: model claude-opus-5-5, max_tokens 16000, effort medium, json_schema, fallbacks default;
+  system 1,737 chars + transcript of 59 words + 6 silences; privacy scan: no file names/paths/user/key.
+Key setup: Terminal attempts didn't store the key (Keychain still empty x3). Added in-app Settings
+  (Settings button -> secure field -> Rust saves via `security -i` on stdin, strict sk-ant- format check;
+  status/remove; key never returned to UI). Owner saved key there; Keychain item confirmed present.
+count_tokens (free) -> API 400 invalid_request_error "Your credit balance is too low to access the
+  Anthropic API" (request-id req_011CgHKA5NBSxcUwdHWMTQAZ). Auth OK, account has no credit.
+BLOCKER: Console account needs credits (owner action: platform.claude.com/settings/billing).
+  Paid call NOT attempted. Ledger: 0 paid calls, $0.00.
+  Retry after owner reported adding credits -> same 400 "credit balance is too low"
+  (request-id req_011CgHKFEpMXp3mbJ8AHhfNH). Still blocked; no paid call.
+  3rd retry -> same 400 (req_011CgHKLwg8wfvFLGTficgkp). Owner learned Claude Pro does not include API
+  credit; chose the free path for now.
+FREE PATH (no API call, $0): plan written by the Claude Code session (owner's Pro plan) from the exact
+  request.json rules/transcript -> test-media/clip-speech.claude-code-plan.json. Editorial choice differs
+  from fixture: hook-first (greeting removed as off_topic), plus dead air, "um", first "how to make",
+  "strong cough" false start removed.
+  `autoedit render` -> output-2.mp4 14.77s 1080x1920 h264+aac, 7 segments, 15 captions (planned 14.66s).
+  Re-transcription: starts "today im going to show you how to make...", no greeting/um/cough, "how to make"
+  x1, "strong" x1; kept-words 91% (diffs = Whisper Tagalog spelling only).
+  verify_export.py --validated --fit crop --srt -> 33/33 PASS. Source checksums OK. API ledger: 0 calls.
+  NOT the acceptance criterion "real authorized API call" - that remains open until the Console has credit.
+
 ## M6 - Local auto-edit pipeline, no API (DONE 2026-10-22)
 Approved by owner: whisper-cpp, multilingual ggml-small.bin, crates ureq/ab_glyph/image. Footage: Tagalog/Taglish.
 Installed: whisper-cpp 1.9.5 (brew). Model ~/Library/Application Support/ai-reel-maker/models/ggml-small.bin,

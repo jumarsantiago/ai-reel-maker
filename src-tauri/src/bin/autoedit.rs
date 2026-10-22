@@ -2,13 +2,49 @@
 //!
 //!   autoedit prepare <video> [--lang auto|tl|en] [--root projects] [--model ID] [--min S] [--max S]
 //!   autoedit render  <project_dir> <plan.json>
+//!   autoedit count   <project_dir>                 (free token count; sends request.json)
+//!   autoedit plan    <project_dir>                 (ONE paid call, budget-gated)
 
-use ai_reel_maker_lib::{autoedit, plan};
+use ai_reel_maker_lib::{api, autoedit, plan};
 use std::path::Path;
 use std::process::ExitCode;
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
+}
+
+const LEDGER: &str = "projects/api_ledger.json";
+const MAX_PAID_CALLS: u32 = 3;
+const MAX_USD: f64 = 1.00;
+
+fn read_request(dir: &str) -> Result<serde_json::Value, String> {
+    let p = Path::new(dir).join("request.json");
+    let t = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+    serde_json::from_str(&t).map_err(|e| format!("{}: {e}", p.display()))
+}
+
+fn paid_plan(dir: &Path) -> Result<(), String> {
+    let req = read_request(&dir.to_string_lossy())?;
+    let ledger_path = Path::new(LEDGER);
+    let mut ledger = api::Ledger::load(ledger_path, MAX_PAID_CALLS, MAX_USD);
+    let n = api::count_tokens(&req)?;
+    let model = req["model"].as_str().unwrap_or_default().to_string();
+    let worst = api::cost_usd(&model, n, plan::MAX_TOKENS as u64).unwrap_or(f64::INFINITY);
+    println!("input tokens {n}; worst case ${worst:.4}; spent so far ${:.4} over {} call(s)", ledger.spent(), ledger.calls.len());
+    ledger.check(worst)?;
+    println!("calling {model} (one request)...");
+    let (edit, r) = api::request_plan(&req, dir, ledger_path, &mut ledger, n)?;
+    let raw = serde_json::to_string_pretty(&edit).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("plan.raw.json"), raw + "\n").map_err(|e| e.to_string())?;
+    let usage = serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("api_usage.json"), usage + "\n").map_err(|e| e.to_string())?;
+    autoedit::log(dir, &format!("API plan call: {} served by {} in {:.1}s, {} in / {} out tokens, ${:.4}, request-id {}",
+        r.model_requested, r.model_served, r.seconds, r.input_tokens, r.output_tokens, r.cost_usd, r.request_id));
+    println!("served by {} in {:.1}s | stop {} | fallback {}", r.model_served, r.seconds, r.stop_reason, r.fallback_used);
+    println!("usage: {} input / {} output tokens -> ${:.4} | total spent ${:.4} over {} call(s)",
+        r.input_tokens, r.output_tokens, r.cost_usd, ledger.spent(), ledger.calls.len());
+    println!("plan: {} segments, {} removals, {} captions -> plan.raw.json", edit.segments.len(), edit.removals.len(), edit.captions.len());
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -45,6 +81,14 @@ fn main() -> ExitCode {
                 println!("warning: {w}");
             }
         }),
+        Some("count") if args.len() >= 3 => read_request(&args[2]).and_then(|req| api::count_tokens(&req)).map(|n| {
+            println!("input tokens (count_tokens, free): {n}");
+            if let Some((i, o)) = api::price_per_mtok(plan::DEFAULT_MODEL) {
+                println!("input cost at ${i}/MTok: ${:.4} | worst case with {} output tokens at ${o}/MTok: ${:.4}",
+                    n as f64 * i / 1e6, plan::MAX_TOKENS, api::cost_usd(plan::DEFAULT_MODEL, n, plan::MAX_TOKENS as u64).unwrap_or(0.0));
+            }
+        }),
+        Some("plan") if args.len() >= 3 => paid_plan(Path::new(&args[2])),
         _ => Err("usage:\n  autoedit prepare <video> [--lang auto] [--root projects] [--model ID] [--min S] [--max S]\n  autoedit render <project_dir> <plan.json>".into()),
     };
     match result {

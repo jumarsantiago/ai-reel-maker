@@ -35,6 +35,8 @@ type ExportState =
   | { kind: "done"; result: ExportResult }
   | { kind: "error"; message: string };
 
+type KeyStatus = { source: "env" | "keychain" | "none"; account: string };
+
 type Selection = { kind: "media"; path: string } | { kind: "clip"; id: string } | null;
 
 const VIDEO_EXTENSIONS = ["mp4", "mov", "m4v", "webm", "mkv"];
@@ -58,6 +60,11 @@ function App() {
   const [trimDraft, setTrimDraft] = useState({ in: "", out: "" });
   const [trimError, setTrimError] = useState<string | null>(null);
   const [exportState, setExportState] = useState<ExportState>({ kind: "idle" });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [keyStatus, setKeyStatus] = useState<KeyStatus | null>(null);
+  const [keyInput, setKeyInput] = useState("");
+  const [settingsMsg, setSettingsMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [savingKey, setSavingKey] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
 
   const selectedMedia = selection?.kind === "media" ? media.find((m) => m.path === selection.path) ?? null : null;
@@ -185,6 +192,56 @@ function App() {
     }
   }
 
+  async function openSettings() {
+    setSettingsOpen(true);
+    setSettingsMsg(null);
+    setKeyInput("");
+    try {
+      setKeyStatus(await invoke<KeyStatus>("api_key_status"));
+    } catch (e) {
+      setSettingsMsg({ ok: false, text: String(e) });
+    }
+  }
+
+  function closeSettings() {
+    setSettingsOpen(false);
+    setKeyInput(""); // never keep the key in memory longer than needed
+  }
+
+  async function saveKey() {
+    setSavingKey(true);
+    setSettingsMsg(null);
+    try {
+      const status = await invoke<KeyStatus>("save_api_key", { key: keyInput });
+      setKeyStatus(status);
+      setSettingsMsg({ ok: true, text: "Saved to your macOS Keychain." });
+    } catch (e) {
+      setSettingsMsg({ ok: false, text: String(e) });
+    } finally {
+      setKeyInput("");
+      setSavingKey(false);
+    }
+  }
+
+  async function removeKey() {
+    setSettingsMsg(null);
+    try {
+      setKeyStatus(await invoke<KeyStatus>("remove_api_key"));
+      setSettingsMsg({ ok: true, text: "Key removed from the Keychain." });
+    } catch (e) {
+      setSettingsMsg({ ok: false, text: String(e) });
+    }
+  }
+
+  const keyLabel =
+    keyStatus === null
+      ? "Checking…"
+      : keyStatus.source === "keychain"
+        ? "Saved in macOS Keychain ✓"
+        : keyStatus.source === "env"
+          ? "Set by the ANTHROPIC_API_KEY environment variable ✓"
+          : "Not set";
+
   const total = totalDuration(clips);
   const rendering = exportState.kind === "rendering";
 
@@ -192,6 +249,10 @@ function App() {
     <div className="app">
       <header className="topbar">
         <span className="project-name">Untitled project</span>
+        <div className="topbar-actions">
+        <button className="btn" onClick={openSettings}>
+          Settings
+        </button>
         <button
           className="btn primary"
           onClick={exportVideo}
@@ -200,6 +261,7 @@ function App() {
         >
           {rendering ? "Exporting…" : "Export"}
         </button>
+        </div>
       </header>
 
       <aside className="panel media-bin">
@@ -338,6 +400,59 @@ function App() {
             : plan.error}
         </div>
       </footer>
+
+      {settingsOpen && (
+        <div className="modal-backdrop" onClick={(e) => e.target === e.currentTarget && closeSettings()}>
+          <div className="modal settings" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+            <h2 id="settings-title">Settings</h2>
+            <h3>Claude API key</h3>
+            <p className="key-status">
+              Status: <strong>{keyLabel}</strong>
+            </p>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (keyInput.trim()) saveKey();
+              }}
+            >
+              <label className="field">
+                {keyStatus?.source === "keychain" ? "Replace key" : "Paste your API key"}
+                <input
+                  type="password"
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder="sk-ant-…"
+                  value={keyInput}
+                  onChange={(e) => setKeyInput(e.target.value)}
+                  autoFocus
+                />
+              </label>
+              <div className="btn-row">
+                <button className="btn primary" type="submit" disabled={!keyInput.trim() || savingKey}>
+                  {savingKey ? "Saving…" : "Save key"}
+                </button>
+                {keyStatus?.source === "keychain" && (
+                  <button className="btn danger" type="button" onClick={removeKey}>
+                    Remove key
+                  </button>
+                )}
+                <button className="btn" type="button" onClick={closeSettings}>
+                  Close
+                </button>
+              </div>
+            </form>
+            {settingsMsg && (
+              <p className={settingsMsg.ok ? "success" : "errors"} role="status">
+                {settingsMsg.text}
+              </p>
+            )}
+            <p className="muted small">
+              The key is stored only in your macOS login Keychain (item “ANTHROPIC_API_KEY”), never in app files.
+              It is used only for requests to api.anthropic.com, which are billed through your Claude Console account.
+            </p>
+          </div>
+        </div>
+      )}
 
       {exportState.kind !== "idle" && (
         <div className="modal-backdrop">

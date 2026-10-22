@@ -1,0 +1,44 @@
+{
+  "summary": {
+    "title": "Perfect iced coffee at home - 15 s reel",
+    "overall_rationale": "Open on the promise (how to make the perfect iced coffee) instead of the generic channel greeting, keep every instruction in order, and cut pauses, the 'um', the first of two 'how to make' and the 'strong cough' false start. Ends on the Taglish sign-off.",
+    "overall_confidence": "high"
+  },
+  "segments": [
+    {"source_id": "clip_1", "start": 4.93, "end": 6.55, "purpose": "hook part 1", "rationale": "'Today I'm going to show you' sets up the promise; ends before the 'um'.", "confidence": "high"},
+    {"source_id": "clip_1", "start": 8.12, "end": 10.51, "purpose": "hook part 2", "rationale": "Second, clean 'how to make the perfect iced coffee at home' completes the hook.", "confidence": "high"},
+    {"source_id": "clip_1", "start": 11.29, "end": 13.33, "purpose": "step 1", "rationale": "'First, you need strong coffee,' is the clean take.", "confidence": "high"},
+    {"source_id": "clip_1", "start": 15.73, "end": 16.68, "purpose": "step 1 continued", "rationale": "'and lots of ice' resumes right after the false start.", "confidence": "medium"},
+    {"source_id": "clip_1", "start": 18.69, "end": 20.95, "purpose": "relatable aside", "rationale": "'Sobrang dali lang nito, promise!' adds personality for a Filipino audience.", "confidence": "high"},
+    {"source_id": "clip_1", "start": 21.68, "end": 24.80, "purpose": "steps 2-3", "rationale": "Milk, syrup, stir - the core method, kept whole.", "confidence": "high"},
+    {"source_id": "clip_1", "start": 26.43, "end": 28.71, "purpose": "sign-off", "rationale": "Short Taglish outro closes the reel.", "confidence": "high"}
+  ],
+  "removals": [
+    {"start": 0.00, "end": 2.64, "kind": "off_topic", "evidence_word_ids": [0, 1, 2, 3, 4, 5, 6], "rationale": "Generic channel greeting is a weak first second for a reel; the topic line is a stronger hook.", "confidence": "medium"},
+    {"start": 2.64, "end": 4.93, "kind": "dead_air", "evidence_word_ids": [6, 7], "rationale": "2.4 s pause after 'channel.'", "confidence": "high"},
+    {"start": 6.55, "end": 7.11, "kind": "filler", "evidence_word_ids": [13], "rationale": "'um,' between 'you,' and 'how'.", "confidence": "high"},
+    {"start": 7.11, "end": 8.12, "kind": "repeat", "evidence_word_ids": [14, 15, 16], "rationale": "'how to make,' is said twice (14-16 and 17-19); drop the first.", "confidence": "high"},
+    {"start": 10.51, "end": 11.29, "kind": "dead_air", "evidence_word_ids": [25, 26], "rationale": "Pause after 'home.'", "confidence": "high"},
+    {"start": 13.33, "end": 15.73, "kind": "mistake", "evidence_word_ids": [31, 32, 33, 34], "rationale": "False start 'strong cough.' then a repeated 'strong coffee,'.", "confidence": "high"},
+    {"start": 16.68, "end": 18.69, "kind": "dead_air", "evidence_word_ids": [38, 39], "rationale": "2 s pause after 'ice.'", "confidence": "high"},
+    {"start": 20.95, "end": 21.68, "kind": "dead_air", "evidence_word_ids": [42, 43], "rationale": "Pause after 'Promise.'", "confidence": "medium"},
+    {"start": 24.80, "end": 26.43, "kind": "dead_air", "evidence_word_ids": [52, 53], "rationale": "1.7 s pause after 'it!'", "confidence": "high"}
+  ],
+  "captions": [
+    {"segment_index": 0, "start": 4.96, "end": 5.85, "text": "Today I'm going"},
+    {"segment_index": 0, "start": 5.85, "end": 6.55, "text": "to show you"},
+    {"segment_index": 1, "start": 8.15, "end": 8.77, "text": "how to make"},
+    {"segment_index": 1, "start": 8.77, "end": 10.05, "text": "the perfect iced coffee"},
+    {"segment_index": 1, "start": 10.05, "end": 10.51, "text": "at home."},
+    {"segment_index": 2, "start": 11.32, "end": 12.47, "text": "First, you need"},
+    {"segment_index": 2, "start": 12.47, "end": 13.33, "text": "strong coffee,"},
+    {"segment_index": 3, "start": 15.76, "end": 16.68, "text": "and lots of ice."},
+    {"segment_index": 4, "start": 18.72, "end": 20.48, "text": "Sobrang dali lang nito,"},
+    {"segment_index": 4, "start": 20.48, "end": 20.95, "text": "promise!"},
+    {"segment_index": 5, "start": 21.71, "end": 22.59, "text": "Pour the milk,"},
+    {"segment_index": 5, "start": 22.59, "end": 23.52, "text": "add the syrup,"},
+    {"segment_index": 5, "start": 23.52, "end": 24.80, "text": "and stir. That's it!"},
+    {"segment_index": 6, "start": 26.46, "end": 27.29, "text": "Salamat,"},
+    {"segment_index": 6, "start": 27.29, "end": 28.71, "text": "and see you next time!"}
+  ]
+}

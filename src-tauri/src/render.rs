@@ -48,6 +48,9 @@ pub struct PlannedSegment {
     pub in_point: f64,
     pub length: f64,
     pub has_audio: bool,
+    /// Source frame size, used to tell whether a clip matches the output's orientation.
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,6 +155,71 @@ pub enum Fit {
     Pad,
     /// Scale up to cover, centre-crop the overflow (vertical reels).
     Crop,
+    /// Whole picture in the middle over a blurred, darkened copy of itself. Clips that already match the
+    /// output's shape are simply scaled to fill it.
+    Blur,
+}
+
+/// Shape of the finished video.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Orientation {
+    /// 9:16, for Reels, TikTok and Shorts.
+    #[default]
+    Vertical,
+    /// 16:9, for YouTube.
+    Horizontal,
+}
+
+impl Orientation {
+    pub fn size(self) -> (u32, u32) {
+        match self {
+            Orientation::Vertical => (1080, 1920),
+            Orientation::Horizontal => (1920, 1080),
+        }
+    }
+
+    /// Text and overlays are sized from the short side, so a caption looks the same in either shape.
+    pub fn short_side(self) -> u32 {
+        1080
+    }
+
+    /// Vertical position (fraction of the height) of captions, hook, tags and CTA.
+    pub fn caption_y(self) -> f64 {
+        match self {
+            Orientation::Vertical => 0.70,
+            Orientation::Horizontal => 0.82,
+        }
+    }
+
+    pub fn hook_y(self) -> f64 {
+        match self {
+            Orientation::Vertical => 0.13,
+            Orientation::Horizontal => 0.16,
+        }
+    }
+
+    pub fn tag_y(self) -> f64 {
+        match self {
+            Orientation::Vertical => 0.075,
+            Orientation::Horizontal => 0.09,
+        }
+    }
+
+    pub fn cta_y(self) -> f64 {
+        match self {
+            Orientation::Vertical => 0.80,
+            Orientation::Horizontal => 0.92,
+        }
+    }
+}
+
+/// True when the clip's shape is close enough to the output's that no bars or crop are needed.
+fn same_shape(src_w: u32, src_h: u32, w: u32, h: u32) -> bool {
+    if src_w == 0 || src_h == 0 {
+        return true;
+    }
+    ((src_w as f64 / src_h as f64) / (w as f64 / h as f64) - 1.0).abs() < 0.03
 }
 
 /// A still image (e.g. a caption PNG) shown over the output between `start` and `end`
@@ -196,6 +264,8 @@ pub fn plan_segments(
             in_point: r.in_point,
             length,
             has_audio: info.has_audio,
+            width: info.width,
+            height: info.height,
         });
         first.get_or_insert(info);
     }
@@ -257,9 +327,12 @@ pub fn build_filter_graph(plan: &Plan) -> String {
     let mut graph = String::new();
     let mut concat_inputs = String::new();
     for (i, s) in plan.segments.iter().enumerate() {
+        // A blurred-background fit only applies to clips whose shape differs from the output's.
+        let blurred = plan.fit == Fit::Blur && !same_shape(s.width, s.height, w, h);
+        let cropping = plan.fit == Fit::Crop || (plan.fit == Fit::Blur && !blurred);
         let frame = match plan.fit {
             Fit::Pad => format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"),
-            Fit::Crop if plan.style.pan => {
+            _ if cropping && plan.style.pan => {
                 // Scale up 8% and drift across it: up to 70px each way over the clip, alternating direction.
                 let dir = if i % 2 == 0 { 1 } else { -1 };
                 format!(
@@ -268,7 +341,7 @@ pub fn build_filter_graph(plan: &Plan) -> String {
                     len = secs(s.length)
                 )
             }
-            Fit::Crop => format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"),
+            _ => format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"),
         };
         let grade = match plan.style.grade {
             Grade::None => "",
@@ -276,12 +349,21 @@ pub fn build_filter_graph(plan: &Plan) -> String {
             Grade::Vivid => ",eq=contrast=1.08:saturation=1.4",
         };
         let z = if plan.style.pan { 1.0 } else { plan.style.zoom.get(i).copied().unwrap_or(1.0) };
-        let zoom = if plan.fit == Fit::Crop && z > 1.001 {
+        let zoom = if cropping && z > 1.001 {
             format!(",scale={}:{},crop={w}:{h}", even((w as f64 * z).round() as u32), even((h as f64 * z).round() as u32))
         } else {
             String::new()
         };
-        graph += &format!("[{i}:v:0]setpts=PTS-STARTPTS,{frame}{zoom}{grade},setsar=1,fps={fps},format=yuv420p[v{i}];");
+        if blurred {
+            graph += &format!(
+                "[{i}:v:0]setpts=PTS-STARTPTS,split=2[bg{i}][fg{i}];\
+                 [bg{i}]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},boxblur=36:4,eq=brightness=-0.10[bb{i}];\
+                 [fg{i}]scale={w}:{h}:force_original_aspect_ratio=decrease[ff{i}];\
+                 [bb{i}][ff{i}]overlay=(W-w)/2:(H-h)/2{grade},setsar=1,fps={fps},format=yuv420p[v{i}];"
+            );
+        } else {
+            graph += &format!("[{i}:v:0]setpts=PTS-STARTPTS,{frame}{zoom}{grade},setsar=1,fps={fps},format=yuv420p[v{i}];");
+        }
         concat_inputs += &format!("[v{i}]");
         if any_audio {
             let len = secs(s.length);
@@ -679,6 +761,32 @@ mod tests {
         assert!(g.contains("[ca]volume=-9.0dB[sp]") && !g.contains("sidechaincompress"));
         assert!(g.contains("afade=t=out:st=4.700:d=0.50"));
         assert!((plan_total(&plan) - 5.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn blur_fit_only_applies_to_clips_of_a_different_shape() {
+        // a.mp4 is 1281x721 (landscape), 1920x1080 output = same shape; 1080x1920 output = different.
+        let mut plan = plan_segments(&[seg("/v/a.mp4", 0.0, 2.0)], fake_probe).unwrap();
+        plan.width = 1920;
+        plan.height = 1080;
+        plan.fit = Fit::Blur;
+        let g = build_filter_graph(&plan);
+        assert!(!g.contains("boxblur"), "same shape: just fill, no blurred bars: {g}");
+        plan.width = 1080;
+        plan.height = 1920;
+        let g = build_filter_graph(&plan);
+        assert!(g.contains("split=2[bg0][fg0]") && g.contains("boxblur=36:4"), "{g}");
+        assert!(g.contains("[bb0][ff0]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=30,format=yuv420p[v0]"), "{g}");
+    }
+
+    #[test]
+    fn orientation_sizes_and_positions() {
+        assert_eq!(Orientation::Vertical.size(), (1080, 1920));
+        assert_eq!(Orientation::Horizontal.size(), (1920, 1080));
+        for o in [Orientation::Vertical, Orientation::Horizontal] {
+            assert_eq!(o.short_side(), 1080);
+            assert!(o.tag_y() < o.hook_y() && o.hook_y() < o.caption_y() && o.caption_y() < o.cta_y());
+        }
     }
 
     #[test]

@@ -210,7 +210,7 @@ pub fn auto_plan(t: &Transcript) -> EditPlan {
             let start = if captions.last().is_some_and(|c: &PlanCaption| c.segment_index == si as i64) { w[first].start } else { seg_start };
             let end = next.map(|n| w[n].start).unwrap_or(seg_end).max(w[last].end);
             let text: Vec<&str> = line.iter().map(|&i| w[i].text.as_str()).collect();
-            captions.push(PlanCaption { segment_index: si as i64, start: round2(start.max(seg_start)), end: round2(end.min(seg_end)), text: text.join(" ") });
+            captions.push(PlanCaption { segment_index: si as i64, start: round2(start.max(seg_start)), end: round2(end.min(seg_end)), text: text.join(" "), trusted: false });
             line.clear();
         };
         for (pos, &i) in g.iter().enumerate() {
@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn short_captions_merge_into_neighbours() {
-        let c = |seg: i64, start: f64, end: f64, text: &str| PlanCaption { segment_index: seg, start, end, text: text.into() };
+        let c = |seg: i64, start: f64, end: f64, text: &str| PlanCaption { segment_index: seg, start, end, text: text.into(), trusted: false };
         let merged = merge_short_captions(vec![
             c(0, 0.0, 1.0, "and lots of"), c(0, 1.0, 1.1, "ice."),   // short tail joins previous
             c(1, 2.0, 2.1, "Oh"), c(1, 2.1, 3.0, "hello there"),       // short head joins next

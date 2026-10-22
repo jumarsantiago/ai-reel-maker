@@ -55,7 +55,26 @@ type EditStyle = {
   highlightWords: boolean;
   loudness: boolean;
   music: string | null;
+  orientation: "vertical" | "horizontal";
+  fitBlur: boolean;
+  captionTemplate: "soft" | "clean" | "blush" | "dark" | "classic";
+  captionFont: string | null;
 };
+
+const CAPTION_TEMPLATES: { value: EditStyle["captionTemplate"]; label: string }[] = [
+  { value: "soft", label: "Soft plum (rounded box)" },
+  { value: "clean", label: "Clean (no background)" },
+  { value: "blush", label: "Blush (light pink box)" },
+  { value: "dark", label: "Dark (black box)" },
+  { value: "classic", label: "Classic (outline, yellow)" },
+];
+
+type FontInfo = { name: string; path: string };
+
+type CaptionDraft = { index: number; text: string; start: number; end: number };
+type ReviewCaption = CaptionDraft & { original: string; deleted: boolean };
+type ReviewState = { dir: string; sourceDurationSec: number; label: string; captions: ReviewCaption[] };
+type PrepareResult = { projectDir: string; sourceDurationSec: number; captions: CaptionDraft[] };
 
 type TravelDraft = {
   clipSec: number;
@@ -127,7 +146,15 @@ function App() {
     highlightWords: true,
     loudness: true,
     music: null,
+    orientation: "vertical",
+    fitBlur: false,
+    captionTemplate: "soft",
+    captionFont: null,
   });
+  const [fonts, setFonts] = useState<FontInfo[]>([]);
+  const [fontPreview, setFontPreview] = useState<string | null>(null);
+  const [reviewCaptions, setReviewCaptions] = useState(true);
+  const [review, setReview] = useState<ReviewState | null>(null);
   const [editMode, setEditMode] = useState<"talk" | "travel">("talk");
   const [travelDraft, setTravelDraft] = useState<TravelDraft>({ clipSec: 4, transition: "smooth", grade: "warm", pan: true, fade: true });
   const [extrasDraft, setExtrasDraft] = useState<ExtrasDraft>({ hook: "", tags: "", cta: "" });
@@ -145,6 +172,20 @@ function App() {
   const plan = toRenderPlan(clips);
 
   // Keep the trim inputs in sync with the selected clip.
+  useEffect(() => {
+    invoke<FontInfo[]>("list_fonts").then(setFonts).catch(() => setFonts([]));
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<string>("caption_preview", { font: editStyle.captionFont, text: null, template: editStyle.captionTemplate })
+      .then((url) => !cancelled && setFontPreview(url))
+      .catch(() => !cancelled && setFontPreview(null));
+    return () => {
+      cancelled = true;
+    };
+  }, [editStyle.captionFont, editStyle.captionTemplate]);
+
   useEffect(() => {
     if (selectedClip) {
       setTrimDraft({ in: selectedClip.inPoint.toFixed(2), out: selectedClip.outPoint.toFixed(2) });
@@ -263,32 +304,43 @@ function App() {
     }
   }
 
+  function timelineSegments() {
+    const planned = toRenderPlan(clips);
+    if (!planned.ok) {
+      setAutoCut({ kind: "error", message: planned.error });
+      return null;
+    }
+    return planned.segments.map((sg) => ({ sourcePath: sg.sourcePath, inPoint: sg.inPoint, outPoint: sg.outPoint }));
+  }
+
   async function runAutoCut(m: MediaInfo) {
-    await startAutoCut(m.fileName, "auto_cut", { path: m.path });
+    if (reviewCaptions) await prepareForReview(m.fileName, { kind: "video", path: m.path });
+    else await startAutoCut(m.fileName, "auto_cut", { path: m.path });
   }
 
   async function runAutoCutTimeline() {
-    const planned = toRenderPlan(clips);
-    if (!planned.ok) {
-      setAutoCut({ kind: "error", message: planned.error });
-      return;
-    }
-    const segments = planned.segments.map((sg) => ({ sourcePath: sg.sourcePath, inPoint: sg.inPoint, outPoint: sg.outPoint }));
-    await startAutoCut(`Timeline: ${plural(clips.length, "clip")}`, "auto_cut_timeline", { segments });
+    const segments = timelineSegments();
+    if (!segments) return;
+    const label = `Timeline: ${plural(clips.length, "clip")}`;
+    if (reviewCaptions) await prepareForReview(label, { kind: "timeline", segments });
+    else await startAutoCut(label, "auto_cut_timeline", { segments });
   }
 
   async function runTravel() {
-    const planned = toRenderPlan(clips);
-    if (!planned.ok) {
-      setAutoCut({ kind: "error", message: planned.error });
-      return;
-    }
-    const segments = planned.segments.map((sg) => ({ sourcePath: sg.sourcePath, inPoint: sg.inPoint, outPoint: sg.outPoint }));
-    const style = { ...travelDraft, music: editStyle.music };
+    const segments = timelineSegments();
+    if (!segments) return;
+    const style = {
+      ...travelDraft,
+      music: editStyle.music,
+      orientation: editStyle.orientation,
+      fit: editStyle.fitBlur ? "blur" : "fill",
+      font: editStyle.captionFont,
+    };
     await startAutoCut(`Travel reel: ${plural(clips.length, "clip")}`, "travel_edit", { segments, style }, false);
   }
 
-  async function startAutoCut(source: string, command: string, args: Record<string, unknown>, withStyle = true) {
+  /** Runs `work` while showing the Auto Edit progress dialog (stage text and progress bar). */
+  async function withProgress<T>(source: string, work: () => Promise<T>): Promise<T | undefined> {
     setAutoCut({ kind: "running", source, stage: "Starting…", progress: 0 });
     const offStage = await listen<string>("autocut-stage", (e) =>
       setAutoCut((s) => (s.kind === "running" ? { ...s, stage: e.payload } : s)),
@@ -297,14 +349,55 @@ function App() {
       setAutoCut((s) => (s.kind === "running" ? { ...s, progress: e.payload } : s)),
     );
     try {
-      const result = await invoke<AutoCutResult>(command, { ...(withStyle ? { style: editStyle } : {}), ...args, extras: toExtras(extrasDraft) });
-      setAutoCut({ kind: "done", result });
+      return await work();
     } catch (e) {
       setAutoCut({ kind: "error", message: String(e) });
+      return undefined;
     } finally {
       offStage();
       offProgress();
     }
+  }
+
+  async function startAutoCut(source: string, command: string, args: Record<string, unknown>, withStyle = true) {
+    const result = await withProgress(source, () =>
+      invoke<AutoCutResult>(command, { ...(withStyle ? { style: editStyle } : {}), ...args, extras: toExtras(extrasDraft) }),
+    );
+    if (result) setAutoCut({ kind: "done", result });
+  }
+
+  /** Transcribe and plan, then let the user check the captions before the reel is rendered. */
+  async function prepareForReview(label: string, source: Record<string, unknown>) {
+    const prepared = await withProgress(label, () =>
+      invoke<PrepareResult>("auto_cut_prepare", { source, style: editStyle, extras: toExtras(extrasDraft) }),
+    );
+    if (!prepared) return;
+    setReview({
+      dir: prepared.projectDir,
+      sourceDurationSec: prepared.sourceDurationSec,
+      label,
+      captions: prepared.captions.map((c) => ({ ...c, original: c.text, deleted: false })),
+    });
+    setAutoCut({ kind: "idle" });
+  }
+
+  async function renderReviewed() {
+    if (!review) return;
+    const r = review;
+    const edits = r.captions
+      .filter((c) => c.deleted || c.text.trim() !== c.original)
+      .map((c) => ({ index: c.index, text: c.text, deleted: c.deleted }));
+    setReview(null);
+    const result = await withProgress(r.label, () =>
+      invoke<AutoCutResult>("auto_cut_render", {
+        projectDir: r.dir,
+        sourceDurationSec: r.sourceDurationSec,
+        style: editStyle,
+        extras: toExtras(extrasDraft),
+        edits,
+      }),
+    );
+    if (result) setAutoCut({ kind: "done", result });
   }
 
   async function chooseMusic() {
@@ -426,6 +519,53 @@ function App() {
                   </label>
                 </div>
   );
+  const lookBox = (
+    <div className="look-box">
+      <div className="travel-grid">
+        <label className="field">
+          Video shape
+          <select
+            value={editStyle.orientation}
+            onChange={(e) => setEditStyle((st) => ({ ...st, orientation: e.target.value as EditStyle["orientation"] }))}
+          >
+            <option value="vertical">Vertical 9:16 (Reels, TikTok)</option>
+            <option value="horizontal">Horizontal 16:9 (YouTube)</option>
+          </select>
+        </label>
+        <label className="field">
+          Clips of a different shape
+          <select value={editStyle.fitBlur ? "blur" : "fill"} onChange={(e) => setEditStyle((st) => ({ ...st, fitBlur: e.target.value === "blur" }))}>
+            <option value="fill">Fill the frame (crop the edges)</option>
+            <option value="blur">Show whole picture on a blurred background</option>
+          </select>
+        </label>
+        <label className="field">
+          Caption style
+          <select
+            value={editStyle.captionTemplate}
+            onChange={(e) => setEditStyle((st) => ({ ...st, captionTemplate: e.target.value as EditStyle["captionTemplate"] }))}
+          >
+            {CAPTION_TEMPLATES.map((t) => (
+              <option key={t.value} value={t.value}>{t.label}</option>
+            ))}
+          </select>
+        </label>
+        <label className="field">
+          Caption font
+          <select
+            value={editStyle.captionFont ?? ""}
+            onChange={(e) => setEditStyle((st) => ({ ...st, captionFont: e.target.value || null }))}
+          >
+            <option value="">Default (rounded)</option>
+            {fonts.map((f) => (
+              <option key={f.path} value={f.path}>{f.name}</option>
+            ))}
+          </select>
+        </label>
+        {fontPreview && <img className="font-preview" src={fontPreview} alt="Caption preview in the chosen font" />}
+      </div>
+    </div>
+  );
   const travelPanel = (
     <>
       <button
@@ -494,6 +634,7 @@ function App() {
                 Travel b-roll
               </button>
             </div>
+            {lookBox}
             {editMode === "travel" ? travelPanel : (
             <>
             <button
@@ -526,6 +667,10 @@ function App() {
                     </label>
                   ))}
                 </div>
+                <label className="check review-check">
+                  <input type="checkbox" checked={reviewCaptions} onChange={(e) => setReviewCaptions(e.target.checked)} />
+                  Check the captions before rendering
+                </label>
                 {musicRow}
                 {extrasBox}
                 <p className="muted small-note">
@@ -699,6 +844,46 @@ function App() {
             : plan.error}
         </div>
       </footer>
+
+      {review && autoCut.kind === "idle" && (
+        <div className="modal-backdrop">
+          <div className="modal wide" role="dialog" aria-modal="true" aria-labelledby="review-title">
+            <h2 id="review-title">Check the captions ({review.captions.filter((c) => !c.deleted).length})</h2>
+            <p className="muted small-note">
+              Fix any spelling, or remove a caption with ✕. The timing stays the same. Rendering starts when you press the button.
+            </p>
+            <div className="review-list">
+              {review.captions.map((c, i) => (
+                <div key={c.index} className={`review-row${c.deleted ? " deleted" : ""}`}>
+                  <span className="muted review-time">{formatTime(c.start)}</span>
+                  <input
+                    type="text"
+                    value={c.text}
+                    disabled={c.deleted}
+                    aria-label={`Caption ${i + 1}`}
+                    onChange={(e) =>
+                      setReview((r) => r && { ...r, captions: r.captions.map((x) => (x.index === c.index ? { ...x, text: e.target.value } : x)) })
+                    }
+                  />
+                  <button
+                    className="btn small"
+                    title={c.deleted ? "Put this caption back" : "Remove this caption"}
+                    onClick={() =>
+                      setReview((r) => r && { ...r, captions: r.captions.map((x) => (x.index === c.index ? { ...x, deleted: !x.deleted } : x)) })
+                    }
+                  >
+                    {c.deleted ? "↩" : "✕"}
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="btn-row">
+              <button className="btn primary" onClick={renderReviewed}>Render reel</button>
+              <button className="btn" onClick={() => setReview(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {autoCut.kind !== "idle" && (
         <div className="modal-backdrop">

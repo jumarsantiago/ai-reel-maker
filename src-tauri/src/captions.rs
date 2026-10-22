@@ -31,6 +31,60 @@ pub struct CaptionStyle {
 
 pub const HIGHLIGHT_RGB: [u8; 3] = [255, 212, 0];
 
+/// Ready-made caption looks the user can pick from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptionTemplate {
+    /// Cream text on a translucent plum pill, peach-rose highlight.
+    #[default]
+    Soft,
+    /// No background: cream text with a thin dark outline.
+    Clean,
+    /// Light blush pill with plum text and a rose highlight.
+    Blush,
+    /// Black translucent pill, white text, warm yellow highlight.
+    Dark,
+    /// White text with a heavy black outline and a yellow highlight (the original look).
+    Classic,
+}
+
+impl CaptionTemplate {
+    pub fn style(self, frame_width: u32) -> CaptionStyle {
+        let s = frame_width as f32 / 1080.0;
+        match self {
+            CaptionTemplate::Soft => CaptionStyle::reels_soft(frame_width),
+            CaptionTemplate::Classic => CaptionStyle::reels(frame_width),
+            CaptionTemplate::Clean => CaptionStyle {
+                font_px: 92.0 * s,
+                max_width: (frame_width as f32 * 0.88) as u32,
+                outline_px: (7.0 * s).round().max(2.0) as u32,
+                padding: (12.0 * s) as u32,
+                text_rgb: [255, 250, 245],
+                highlight_rgb: [255, 205, 160],
+                pill: None,
+            },
+            CaptionTemplate::Blush => CaptionStyle {
+                font_px: 80.0 * s,
+                max_width: (frame_width as f32 * 0.86) as u32,
+                outline_px: 0,
+                padding: (30.0 * s) as u32,
+                text_rgb: [88, 52, 68],
+                highlight_rgb: [190, 60, 100],
+                pill: Some(Pill { bg: [255, 238, 240, 238], border: [214, 140, 160, 230], border_px: 3.0 * s, radius: 46.0 * s }),
+            },
+            CaptionTemplate::Dark => CaptionStyle {
+                font_px: 82.0 * s,
+                max_width: (frame_width as f32 * 0.86) as u32,
+                outline_px: 0,
+                padding: (28.0 * s) as u32,
+                text_rgb: [255, 255, 255],
+                highlight_rgb: [255, 214, 120],
+                pill: Some(Pill { bg: [0, 0, 0, 160], border: [255, 255, 255, 50], border_px: 2.0 * s, radius: 30.0 * s }),
+            },
+        }
+    }
+}
+
 impl CaptionStyle {
     /// Bigger, bolder "Reels" captions (1-3 words) for a vertical frame.
     pub fn reels(frame_width: u32) -> Self {
@@ -120,6 +174,41 @@ impl CaptionStyle {
 
 pub fn load_font() -> Result<FontVec, String> {
     load_font_for(DEFAULT_FONT)
+}
+
+/// Folders a caption font may be picked from (system and user fonts only, so a bad path cannot read other files).
+pub fn font_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![PathBuf::from("/System/Library/Fonts"), PathBuf::from("/Library/Fonts")];
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join("Library/Fonts"));
+    }
+    dirs
+}
+
+/// Accepts only an absolute font file (ttf/otf/ttc/otc) inside one of [`font_dirs`].
+pub fn check_font_path(path: &str) -> Result<PathBuf, String> {
+    let p = PathBuf::from(path);
+    let ext = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+    if !p.is_absolute() || !["ttf", "otf", "ttc", "otc"].contains(&ext.as_str()) {
+        return Err("Pick a font file (.ttf, .otf or .ttc) from the font list.".into());
+    }
+    let real = std::fs::canonicalize(&p).map_err(|e| format!("Font not found: {path} ({e})"))?;
+    if !font_dirs().iter().filter_map(|d| std::fs::canonicalize(d).ok()).any(|d| real.starts_with(d)) {
+        return Err("Fonts must come from the system or user Fonts folders.".into());
+    }
+    Ok(real)
+}
+
+/// The font chosen in the app (if any), else `AIRM_CAPTION_FONT`, else `default_path`.
+pub fn load_font_choice(choice: Option<&str>, default_path: &str) -> Result<FontVec, String> {
+    match choice.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(c) => {
+            let path = check_font_path(c)?;
+            let bytes = std::fs::read(&path).map_err(|e| format!("Cannot read font {}: {e}", path.display()))?;
+            FontVec::try_from_vec(bytes).map_err(|_| format!("Cannot use font {}", path.display()))
+        }
+        None => load_font_for(default_path),
+    }
 }
 
 /// `AIRM_CAPTION_FONT` always wins; otherwise `default_path`.
@@ -323,6 +412,34 @@ mod tests {
             ValidCaption { text: "Salamat!".into(), out_start: 61.5, out_end: 62.0 },
         ];
         assert_eq!(to_srt(&caps), "1\n00:00:00,000 --> 00:00:01,250\nHi everyone\n\n2\n00:01:01,500 --> 00:01:02,000\nSalamat!\n");
+    }
+
+    #[test]
+    fn every_template_renders_and_only_clean_and_classic_have_no_pill() {
+        let Ok(font) = load_font() else {
+            eprintln!("skipped: caption font missing");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("arm-templates-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for t in [CaptionTemplate::Soft, CaptionTemplate::Clean, CaptionTemplate::Blush, CaptionTemplate::Dark, CaptionTemplate::Classic] {
+            let style = t.style(1080);
+            assert_eq!(style.pill.is_none(), matches!(t, CaptionTemplate::Clean | CaptionTemplate::Classic), "{t:?}");
+            let p = dir.join(format!("{t:?}.png"));
+            let (w, h) = render_words_png(&font, &style, "Sobrang dali", Some(1), &p).unwrap();
+            let img = image::open(&p).unwrap().to_rgba8();
+            assert_eq!((img.width(), img.height()), (w, h));
+            // The very corner is see-through in every look (rounded pill, or no box at all).
+            assert_eq!(img.get_pixel(0, 0).0[3], 0, "{t:?}");
+            // A pill look paints the middle-left edge; a no-background look leaves most of the frame clear.
+            let opaque = img.pixels().filter(|px| px.0[3] > 100).count() as f32 / (w * h) as f32;
+            if style.pill.is_some() {
+                assert!(opaque > 0.5, "{t:?} {opaque}");
+            } else {
+                assert!(opaque < 0.5, "{t:?} {opaque}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

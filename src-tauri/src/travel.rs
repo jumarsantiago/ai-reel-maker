@@ -7,12 +7,10 @@ use crate::autoedit::{check_music, log};
 use crate::captions;
 use crate::extras::{self, Extras};
 use crate::media;
-use crate::render::{self, Fit, Grade, Music, SegmentRequest, Style, Transition, TransitionStyle};
+use crate::render::{self, Fit, Grade, Music, Orientation, SegmentRequest, Style, Transition, TransitionStyle};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-const WIDTH: u32 = 1080;
-const HEIGHT: u32 = 1920;
 const MUSIC_GAIN_DB: f64 = -16.0;
 const NATURAL_GAIN_DB: f64 = -9.0;
 const TRANSITION_SEC: f64 = 0.45;
@@ -33,11 +31,27 @@ pub struct TravelStyle {
     pub fade: bool,
     /// Optional music file (looped, steady level).
     pub music: Option<String>,
+    /// Vertical 9:16 or horizontal 16:9.
+    pub orientation: Orientation,
+    /// "fill" crops each clip to the frame; "blur" keeps the whole picture over a blurred copy of itself.
+    pub fit: String,
+    /// Font file for the hook, tags and CTA (a system or user font); `None` = built-in rounded font.
+    pub font: Option<String>,
 }
 
 impl Default for TravelStyle {
     fn default() -> Self {
-        Self { clip_sec: 4.0, transition: "smooth".into(), pan: true, grade: "warm".into(), fade: true, music: None }
+        Self {
+            clip_sec: 4.0,
+            transition: "smooth".into(),
+            pan: true,
+            grade: "warm".into(),
+            fade: true,
+            music: None,
+            orientation: Orientation::Vertical,
+            fit: "fill".into(),
+            font: None,
+        }
     }
 }
 
@@ -83,9 +97,10 @@ pub fn travel_edit(
     stage(&format!("Preparing {} clip(s)…", segments.len()));
     let reqs: Vec<SegmentRequest> = segments.iter().map(|s| capped(s, style.clip_sec)).collect();
     let mut plan = render::plan_segments(&reqs, media::probe)?;
-    plan.width = WIDTH;
-    plan.height = HEIGHT;
-    plan.fit = Fit::Crop;
+    let (width, height) = style.orientation.size();
+    plan.width = width;
+    plan.height = height;
+    plan.fit = if style.fit == "blur" { Fit::Blur } else { Fit::Crop };
     plan.style = Style {
         pan: style.pan,
         grade: grade_of(&style.grade),
@@ -107,8 +122,8 @@ pub fn travel_edit(
         for n in &notes {
             log(&dir, &format!("extras: {n}"));
         }
-        let font = captions::load_font_for(captions::SOFT_FONT)?;
-        plan.overlays = extras::overlays(&font, &placed, WIDTH, &cap_dir)?;
+        let font = captions::load_font_choice(style.font.as_deref(), captions::SOFT_FONT)?;
+        plan.overlays = extras::overlays(&font, &placed, style.orientation, &cap_dir)?;
         std::fs::write(dir.join("extras.json"), serde_json::to_string_pretty(x).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     }
     std::fs::write(dir.join("style.json"), serde_json::to_string_pretty(style).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
@@ -154,6 +169,39 @@ mod tests {
         assert_eq!(s.grade, "vivid");
         assert_eq!(s.clip_sec, 4.0);
         assert!(s.pan && s.fade);
+    }
+
+    /// Horizontal 16:9 from mixed portrait/landscape clips, blurred-background fit.
+    #[test]
+    fn real_horizontal_reel_with_blur_fit() {
+        let Some(ffmpeg) = media::find_tool("ffmpeg") else {
+            eprintln!("skipped: ffmpeg not installed");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("arm-travel-h-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut segs = Vec::new();
+        for (i, size) in ["640x360", "360x640"].into_iter().enumerate() {
+            let p = dir.join(format!("h{i}.mp4"));
+            let ok = std::process::Command::new(&ffmpeg)
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg(format!("testsrc2=size={size}:rate=25:duration=3"))
+                .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+                .arg(&p)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+            segs.push(SegmentRequest { source_path: p.to_string_lossy().into_owned(), in_point: 0.0, out_point: 3.0 });
+        }
+        let style = TravelStyle { orientation: Orientation::Horizontal, fit: "blur".into(), ..Default::default() };
+        let ex = Extras { hook: Some("HELLO".into()), cta: Some("LINK BELOW".into()), ..Default::default() };
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let (_, r) = travel_edit(&segs, &root, &style, Some(&ex), |_| {}, |_| {}).unwrap();
+        assert_eq!((r.width, r.height), (1920, 1080));
+        assert!((r.duration_sec - 5.55).abs() < 0.3, "duration {}", r.duration_sec);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Real render: silent and noisy landscape clips become one vertical reel with crossfades.

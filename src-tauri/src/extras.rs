@@ -10,14 +10,11 @@
 
 use crate::captions::{self, CaptionStyle};
 use crate::plan::ValidCaption;
-use crate::render::Overlay;
+use crate::render::{Orientation, Overlay};
 use ab_glyph::{Font, FontVec};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const HOOK_Y_FRAC: f64 = 0.13;
-pub const TAG_Y_FRAC: f64 = 0.075;
-pub const CTA_Y_FRAC: f64 = 0.80;
 const MIN_SEC: f64 = 0.8;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -163,13 +160,14 @@ pub fn drawable(font: &FontVec, text: &str) -> String {
 }
 
 /// Renders each placed extra to a PNG in `cap_dir` and returns the overlays.
-pub fn overlays(font: &FontVec, placed: &[Placed], width: u32, cap_dir: &Path) -> Result<Vec<Overlay>, String> {
+pub fn overlays(font: &FontVec, placed: &[Placed], orientation: Orientation, cap_dir: &Path) -> Result<Vec<Overlay>, String> {
+    let width = orientation.short_side();
     let mut out = Vec::new();
     for (i, p) in placed.iter().enumerate() {
         let (style, y) = match p.kind {
-            Kind::Hook => (CaptionStyle::hook(width), HOOK_Y_FRAC),
-            Kind::Tag => (CaptionStyle::tag(width), TAG_Y_FRAC),
-            Kind::Cta => (CaptionStyle::cta(width), CTA_Y_FRAC),
+            Kind::Hook => (CaptionStyle::hook(width), orientation.hook_y()),
+            Kind::Tag => (CaptionStyle::tag(width), orientation.tag_y()),
+            Kind::Cta => (CaptionStyle::cta(width), orientation.cta_y()),
         };
         let png = cap_dir.join(format!("x{i:02}-{:?}.png", p.kind).to_lowercase());
         let text = drawable(font, &p.text);

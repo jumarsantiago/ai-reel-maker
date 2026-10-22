@@ -123,3 +123,17 @@ dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; 
 .btn.small.active { background: var(--accent); color: #0f1115; border-color: var(--accent); }
 .travel-grid { display: grid; gap: 10px; margin-top: 12px; }
 .travel-grid .field select { background: #0f1115; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font: inherit; font-size: 12px; }
+
+/* Look settings and caption review */
+.look-box { margin-bottom: 10px; }
+.look-box .travel-grid { margin-top: 0; }
+.look-box select { background: #0f1115; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font: inherit; font-size: 12px; }
+.font-preview { width: 100%; max-width: 100%; box-sizing: border-box; justify-self: stretch; object-fit: contain; border-radius: 8px; background: #4a5558; padding: 6px; }
+.review-check { margin-top: 12px; }
+.modal.wide { width: min(720px, 92vw); max-width: 92vw; }
+.review-list { display: grid; gap: 6px; max-height: 52vh; overflow: auto; margin: 10px 0 14px; padding-right: 4px; }
+.review-row { display: grid; grid-template-columns: 58px 1fr auto; gap: 8px; align-items: center; }
+.review-row input { background: #0f1115; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; font: inherit; font-size: 13px; }
+.review-row input:focus-visible { outline: 2px solid var(--accent); }
+.review-row.deleted input { text-decoration: line-through; opacity: 0.45; }
+.review-time { font-size: 12px; font-variant-numeric: tabular-nums; }

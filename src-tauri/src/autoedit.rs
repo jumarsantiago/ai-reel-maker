@@ -3,16 +3,15 @@
 //!   captions/*.png, output.srt, output.mp4, output_transcript.json, render_report.json, log.txt
 //! `prepare` and `render` are fully local; the paid planning call is a separate, explicit step.
 
-use crate::captions::{self, CaptionStyle};
+use crate::captions::{self, CaptionStyle, CaptionTemplate};
 use crate::media::{self, MediaInfo};
 use crate::plan::{self, EditPlan, PlanSettings, ValidatedPlan};
-use crate::render::{self, Fit, Overlay, Plan, PlannedSegment};
+use crate::render::{self, Fit, Orientation, Overlay, Plan, PlannedSegment};
 use crate::transcribe::{self, Transcript};
 use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub const CAPTION_Y_FRAC: f64 = 0.70;
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
@@ -139,6 +138,18 @@ pub struct EditStyle {
     pub loudness: bool,
     /// Optional background music file (looped, ducked under speech).
     pub music: Option<String>,
+    /// Shape of the finished video: vertical 9:16 or horizontal 16:9.
+    #[serde(default)]
+    pub orientation: Orientation,
+    /// Clips of a different shape sit whole over a blurred copy of themselves instead of being cropped.
+    #[serde(default)]
+    pub fit_blur: bool,
+    /// Which ready-made caption look to use (when soft captions are on).
+    #[serde(default)]
+    pub caption_template: CaptionTemplate,
+    /// Caption font file chosen in the app (a system or user font); `None` = the built-in rounded font.
+    #[serde(default)]
+    pub caption_font: Option<String>,
 }
 
 fn default_soft_captions() -> bool {
@@ -147,13 +158,13 @@ fn default_soft_captions() -> bool {
 
 impl Default for EditStyle {
     fn default() -> Self {
-        Self { zoom: true, sound_effects: true, highlight_words: true, soft_captions: true, loudness: true, music: None }
+        Self { zoom: true, sound_effects: true, highlight_words: true, soft_captions: true, loudness: true, music: None, orientation: Orientation::Vertical, fit_blur: false, caption_template: CaptionTemplate::Soft, caption_font: None }
     }
 }
 
 impl EditStyle {
     pub fn plain() -> Self {
-        Self { zoom: false, sound_effects: false, highlight_words: false, soft_captions: false, loudness: false, music: None }
+        Self { zoom: false, sound_effects: false, highlight_words: false, soft_captions: false, loudness: false, music: None, orientation: Orientation::Vertical, fit_blur: false, caption_template: CaptionTemplate::Soft, caption_font: None }
     }
 }
 
@@ -276,11 +287,20 @@ pub fn render_plan(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: 
         std::fs::remove_dir_all(&cap_dir).map_err(|e| e.to_string())?; // our own generated PNGs only
     }
     std::fs::create_dir_all(&cap_dir).map_err(|e| e.to_string())?;
-    let font = if look.soft_captions { captions::load_font_for(captions::SOFT_FONT)? } else { captions::load_font()? };
+    let (out_w, out_h) = look.orientation.size();
+    let short = look.orientation.short_side();
+    let cap_y = look.orientation.caption_y();
+    let font = if look.caption_font.is_some() {
+        captions::load_font_choice(look.caption_font.as_deref(), captions::SOFT_FONT)?
+    } else if look.soft_captions {
+        captions::load_font_for(captions::SOFT_FONT)?
+    } else {
+        captions::load_font()?
+    };
     let cap_style = match (look.soft_captions, look.highlight_words) {
-        (true, _) => CaptionStyle::reels_soft(settings.width),
-        (false, true) => CaptionStyle::reels(settings.width),
-        (false, false) => CaptionStyle::for_width(settings.width),
+        (true, _) => look.caption_template.style(short),
+        (false, true) => CaptionStyle::reels(short),
+        (false, false) => CaptionStyle::for_width(short),
     };
     let mut overlays = Vec::new();
     for (i, c) in v.captions.iter().enumerate() {
@@ -291,12 +311,12 @@ pub fn render_plan(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: 
                 }
                 let png = cap_dir.join(format!("{i:03}-{k:02}.png"));
                 captions::render_words_png(&font, &cap_style, &c.text, Some(k), &png)?;
-                overlays.push(Overlay { image: png, start: a, end: b, y_center_frac: CAPTION_Y_FRAC });
+                overlays.push(Overlay { image: png, start: a, end: b, y_center_frac: cap_y });
             }
         } else {
             let png = cap_dir.join(format!("{i:03}.png"));
             captions::render_png(&font, &cap_style, &c.text, &png)?;
-            overlays.push(Overlay { image: png, start: c.out_start, end: c.out_end, y_center_frac: CAPTION_Y_FRAC });
+            overlays.push(Overlay { image: png, start: c.out_start, end: c.out_end, y_center_frac: cap_y });
         }
     }
     if let Some(extras) = crate::extras::load(dir)? {
@@ -305,8 +325,8 @@ pub fn render_plan(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: 
             log(dir, &format!("extras: {n}"));
         }
         log(dir, &format!("extras: {} overlay(s)", placed.len()));
-        let xfont = captions::load_font_for(captions::SOFT_FONT)?;
-        overlays.extend(crate::extras::overlays(&xfont, &placed, settings.width, &cap_dir)?);
+        let xfont = captions::load_font_choice(look.caption_font.as_deref(), captions::SOFT_FONT)?;
+        overlays.extend(crate::extras::overlays(&xfont, &placed, look.orientation, &cap_dir)?);
     }
     let srt_path = next_free(dir, "output", "srt");
     std::fs::write(&srt_path, captions::to_srt(&v.captions)).map_err(|e| e.to_string())?;
@@ -330,12 +350,19 @@ pub fn render_plan(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: 
         segments: v
             .segments
             .iter()
-            .map(|s| PlannedSegment { path: source.clone(), in_point: s.start, length: s.end - s.start, has_audio: info.has_audio })
+            .map(|s| PlannedSegment {
+                path: source.clone(),
+                in_point: s.start,
+                length: s.end - s.start,
+                has_audio: info.has_audio,
+                width: info.width,
+                height: info.height,
+            })
             .collect(),
-        width: settings.width,
-        height: settings.height,
+        width: out_w,
+        height: out_h,
         fps: if (1..=120).contains(&fps) { fps } else { 30 },
-        fit: Fit::Crop,
+        fit: if look.fit_blur { Fit::Blur } else { Fit::Crop },
         overlays,
         style: render::Style {
             zoom,
@@ -395,23 +422,119 @@ pub fn auto_cut_with(
     stage: impl Fn(&str),
     on_progress: impl Fn(f64),
 ) -> Result<(PathBuf, RenderReport), String> {
+    let dir = auto_cut_prepare(video, root, language, look, extras, &stage)?;
+    stage("Rendering…");
+    let report = render_plan(&dir, &dir.join("plan.autocut.json"), look, on_progress)?;
+    Ok((dir, report))
+}
+
+/// First half of Auto Edit: transcribe and plan the cuts and captions, but do not render yet.
+/// The plan is `plan.autocut.json` in the returned project folder.
+pub fn auto_cut_prepare(
+    video: &str,
+    root: &Path,
+    language: &str,
+    look: &EditStyle,
+    extras: Option<&crate::extras::Extras>,
+    stage: impl Fn(&str),
+) -> Result<PathBuf, String> {
     if let Some(m) = &look.music {
         check_music(m)?; // fail fast, before transcribing
     }
     stage("Transcribing…");
     let dir = prepare(video, root, language, &PlanSettings::default(), plan::DEFAULT_MODEL)?;
-    if let Some(x) = extras {
-        write_json(&dir.join("extras.json"), x)?;
-    }
+    write_extras(&dir, extras)?;
     stage("Planning cuts…");
     let t: Transcript = read_json(&dir.join("transcript.json"))?;
     let edit = crate::autoplan::auto_plan(&t);
     let plan_path = dir.join("plan.autocut.json");
     write_json(&plan_path, &edit)?;
     log(&dir, &format!("auto-cut plan (rules, no AI): {} segments, {} removals, {} captions", edit.segments.len(), edit.removals.len(), edit.captions.len()));
-    stage("Rendering…");
-    let report = render_plan(&dir, &plan_path, look, on_progress)?;
-    Ok((dir, report))
+    Ok(dir)
+}
+
+/// Saves (or removes) the project's `extras.json`, which the render step reads.
+pub fn write_extras(dir: &Path, extras: Option<&crate::extras::Extras>) -> Result<(), String> {
+    let path = dir.join("extras.json");
+    match extras {
+        Some(x) => write_json(&path, x),
+        None => {
+            let _ = std::fs::remove_file(&path);
+            Ok(())
+        }
+    }
+}
+
+/// One caption as shown in the review list: its position in the plan, its text, and when it appears in the reel.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptionDraft {
+    pub index: usize,
+    pub text: String,
+    /// Seconds on the finished reel's timeline.
+    pub start: f64,
+    pub end: f64,
+}
+
+/// A change the user made to one caption in the review list.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptionEdit {
+    pub index: usize,
+    pub text: String,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+/// The planned captions with their time on the finished reel (cuts shift every later caption earlier).
+pub fn caption_drafts(dir: &Path) -> Result<Vec<CaptionDraft>, String> {
+    let t: Transcript = read_json(&dir.join("transcript.json"))?;
+    let edit: EditPlan = read_json(&dir.join("plan.autocut.json"))?;
+    let v = plan::validate(&edit, &t).map_err(|e| format!("Plan rejected:\n- {}", e.join("\n- ")))?;
+    Ok(edit
+        .captions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, c)| {
+            let seg = v.segments.get(usize::try_from(c.segment_index).ok()?)?;
+            let (a, b) = (c.start.max(seg.start), c.end.min(seg.end));
+            Some(CaptionDraft { index, text: c.text.clone(), start: seg.out_start + (a - seg.start), end: seg.out_start + (b - seg.start) })
+        })
+        .collect())
+}
+
+/// Applies the user's caption edits to `plan.autocut.json` (the first original is kept beside it). Edited
+/// captions are marked trusted, so the "words must match the transcript" check no longer rejects them.
+pub fn apply_caption_edits(dir: &Path, edits: &[CaptionEdit]) -> Result<usize, String> {
+    let plan_path = dir.join("plan.autocut.json");
+    let backup = dir.join("plan.autocut.original.json");
+    if !backup.exists() {
+        std::fs::copy(&plan_path, &backup).map_err(|e| format!("Cannot back up the plan: {e}"))?;
+    }
+    let mut edit: EditPlan = read_json(&backup)?; // always apply to the untouched plan, so edits are repeatable
+    let mut changed = 0;
+    let mut drop: Vec<usize> = Vec::new();
+    for e in edits {
+        let Some(c) = edit.captions.get_mut(e.index) else {
+            return Err(format!("Caption {} does not exist.", e.index));
+        };
+        let text = e.text.trim();
+        if e.deleted || text.is_empty() {
+            drop.push(e.index);
+            changed += 1;
+        } else if text != c.text {
+            c.text = text.to_string();
+            c.trusted = true;
+            changed += 1;
+        }
+    }
+    drop.sort_unstable();
+    drop.dedup();
+    for i in drop.into_iter().rev() {
+        edit.captions.remove(i);
+    }
+    write_json(&plan_path, &edit)?;
+    Ok(changed)
 }
 
 /// Auto Edit for several timeline clips (in timeline order, with their trims): joins them into one
@@ -425,6 +548,17 @@ pub fn auto_cut_timeline(
     stage: impl Fn(&str),
     on_progress: impl Fn(f64),
 ) -> Result<(PathBuf, RenderReport), String> {
+    let joined = join_timeline(segments, root, look, &stage)?;
+    auto_cut_with(&joined.to_string_lossy(), root, language, look, extras, stage, on_progress)
+}
+
+/// Joins the timeline clips (in order, with their trims) into one working video under `root`.
+pub fn join_timeline(
+    segments: &[crate::render::SegmentRequest],
+    root: &Path,
+    look: &EditStyle,
+    stage: impl Fn(&str),
+) -> Result<PathBuf, String> {
     if segments.is_empty() {
         return Err("Timeline is empty. Add clips with the + button first.".into());
     }
@@ -442,12 +576,82 @@ pub fn auto_cut_timeline(
         overwrite_confirmed: false,
     };
     crate::render::export(&req, |_| {})?;
-    auto_cut_with(&joined.to_string_lossy(), root, language, look, extras, stage, on_progress)
+    Ok(joined)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn project_with_transcript() -> (PathBuf, Transcript) {
+        use crate::transcribe::{Interval, Word};
+        let dir = std::env::temp_dir().join(format!("arm-review-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = ["Sobrang", "dali", "lang", "nito,", "promise", "talaga", "mga", "ka-reels!", "Salamat", "po."];
+        let mut t0 = 0.1;
+        let words: Vec<Word> = spec
+            .iter()
+            .enumerate()
+            .map(|(id, text)| {
+                // a long pause before "Salamat" so the plan makes two segments and cuts the pause
+                if id == 8 {
+                    t0 += 1.5;
+                }
+                let w = Word { id, text: text.to_string(), start: t0, end: t0 + 0.3 };
+                t0 += 0.35;
+                w
+            })
+            .collect();
+        let t = Transcript {
+            source_id: "clip_1".into(),
+            duration_sec: t0 + 0.4,
+            language_requested: "tl".into(),
+            languages_detected: vec![],
+            words,
+            silences: Vec::<Interval>::new(),
+            speech_chunks: vec![],
+            whisper_model: "test".into(),
+            timing_method: "test".into(),
+        };
+        write_json(&dir.join("transcript.json"), &t).unwrap();
+        write_json(&dir.join("plan.autocut.json"), &crate::autoplan::auto_plan(&t)).unwrap();
+        (dir, t)
+    }
+
+    #[test]
+    fn caption_drafts_edits_and_deletes_keep_the_plan_valid() {
+        let (dir, t) = project_with_transcript();
+        let drafts = caption_drafts(&dir).unwrap();
+        assert!(drafts.len() >= 3, "{drafts:?}");
+        assert!(drafts.windows(2).all(|w| w[0].start <= w[1].start), "times on the reel are in order");
+        // The pause was cut, so the last caption appears earlier on the reel than in the source.
+        let last = drafts.last().unwrap();
+        assert!(last.start < t.words[8].start - 1.0, "{last:?}");
+
+        let edits = vec![
+            CaptionEdit { index: 0, text: "Sobrang dali lang nito!!".into(), deleted: false },
+            CaptionEdit { index: 1, text: "  ".into(), deleted: false }, // empty = removed
+            CaptionEdit { index: drafts.len() - 1, text: "Maraming salamat po".into(), deleted: false },
+        ];
+        assert_eq!(apply_caption_edits(&dir, &edits).unwrap(), 3);
+        let after: EditPlan = read_json(&dir.join("plan.autocut.json")).unwrap();
+        assert_eq!(after.captions.len(), drafts.len() - 1);
+        assert_eq!(after.captions[0].text, "Sobrang dali lang nito!!");
+        assert!(after.captions[0].trusted && !after.captions[1].trusted);
+        let v = plan::validate(&after, &t).unwrap_or_else(|e| panic!("plan rejected: {e:?}"));
+        assert_eq!(v.captions.len(), after.captions.len());
+        assert_eq!(v.captions.last().unwrap().text, "Maraming salamat po");
+
+        // Applying again starts from the original plan, so a second edit does not stack on the first.
+        let again = vec![CaptionEdit { index: 0, text: "Iba naman".into(), deleted: false }];
+        apply_caption_edits(&dir, &again).unwrap();
+        let after2: EditPlan = read_json(&dir.join("plan.autocut.json")).unwrap();
+        assert_eq!(after2.captions.len(), drafts.len());
+        assert_eq!(after2.captions[0].text, "Iba naman");
+        assert_eq!(after2.captions[1].text, drafts[1].text);
+        assert!(apply_caption_edits(&dir, &[CaptionEdit { index: 999, text: "x".into(), deleted: false }]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn word_times_follow_transcript_or_length() {

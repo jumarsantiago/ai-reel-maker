@@ -3,6 +3,7 @@ pub mod autoedit;
 pub mod autoplan;
 pub mod captions;
 pub mod extras;
+pub mod fonts;
 pub mod inbox;
 pub mod media;
 pub mod plan;
@@ -172,6 +173,101 @@ async fn auto_cut_timeline(
     finish_auto_cut(&app, dir, report, source_sec)
 }
 
+/// What Auto Edit works on: one video, or every clip on the timeline.
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum AutoSource {
+    Video { path: String },
+    Timeline { segments: Vec<render::SegmentRequest> },
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrepareResult {
+    project_dir: String,
+    source_duration_sec: f64,
+    captions: Vec<autoedit::CaptionDraft>,
+}
+
+/// First half of Auto Edit with caption review: transcribe and plan, then hand back the captions to check.
+#[tauri::command]
+async fn auto_cut_prepare(
+    app: tauri::AppHandle,
+    source: AutoSource,
+    style: Option<autoedit::EditStyle>,
+    extras: Option<extras::Extras>,
+) -> Result<PrepareResult, String> {
+    let look = style.unwrap_or_default();
+    let root = auto_cut_root()?;
+    let emitter = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let stage = |s: &str| {
+            let _ = emitter.emit("autocut-stage", s.to_string());
+        };
+        let (video, source_duration_sec) = match &source {
+            AutoSource::Video { path } => (path.clone(), media::probe(path)?.duration_sec),
+            AutoSource::Timeline { segments } => {
+                let sec: f64 = segments.iter().map(|s| (s.out_point - s.in_point).max(0.0)).sum();
+                (autoedit::join_timeline(segments, &root, &look, stage)?.to_string_lossy().into_owned(), sec)
+            }
+        };
+        let dir = autoedit::auto_cut_prepare(&video, &root, &auto_cut_language(), &look, extras.as_ref(), stage)?;
+        let captions = autoedit::caption_drafts(&dir)?;
+        Ok(PrepareResult { project_dir: dir.to_string_lossy().into_owned(), source_duration_sec, captions })
+    })
+    .await
+    .map_err(|e| format!("Auto-cut task failed: {e}"))?
+}
+
+/// Second half: apply the user's caption edits and render. Only folders made by this app are accepted.
+#[tauri::command]
+async fn auto_cut_render(
+    app: tauri::AppHandle,
+    project_dir: String,
+    source_duration_sec: f64,
+    style: Option<autoedit::EditStyle>,
+    extras: Option<extras::Extras>,
+    edits: Vec<autoedit::CaptionEdit>,
+) -> Result<AutoCutResult, String> {
+    let look = style.unwrap_or_default();
+    let root = std::fs::canonicalize(auto_cut_root()?).map_err(|e| e.to_string())?;
+    let dir = std::fs::canonicalize(&project_dir).map_err(|e| format!("Project folder not found: {e}"))?;
+    if !dir.starts_with(&root) || !dir.join("plan.autocut.json").is_file() {
+        return Err("That is not an Auto Edit project folder.".into());
+    }
+    let progress = app.clone();
+    let dir2 = dir.clone();
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        autoedit::write_extras(&dir2, extras.as_ref())?;
+        autoedit::apply_caption_edits(&dir2, &edits)?;
+        let _ = app_emit_stage(&progress, "Rendering…");
+        autoedit::render_plan(&dir2, &dir2.join("plan.autocut.json"), &look, |f| {
+            let _ = progress.emit("autocut-progress", f);
+        })
+    })
+    .await
+    .map_err(|e| format!("Render task failed: {e}"))??;
+    finish_auto_cut(&app, dir, report, source_duration_sec)
+}
+
+fn app_emit_stage(app: &tauri::AppHandle, text: &str) -> tauri::Result<()> {
+    app.emit("autocut-stage", text.to_string())
+}
+
+/// Caption font choices for the picker (system and user fonts that can draw Tagalog and English).
+#[tauri::command]
+async fn list_fonts() -> Result<Vec<fonts::FontInfo>, String> {
+    tauri::async_runtime::spawn_blocking(fonts::list_fonts).await.map_err(|e| e.to_string())
+}
+
+/// A real caption drawn in the chosen font, as a PNG data URL.
+#[tauri::command]
+async fn caption_preview(font: Option<String>, text: Option<String>, template: Option<captions::CaptionTemplate>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || fonts::preview_data_url(font.as_deref(), text.as_deref(), template.unwrap_or_default()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Travel mode: the timeline's b-roll clips become one vertical reel (nothing is cut for silence).
 #[tauri::command]
 async fn travel_edit(
@@ -225,7 +321,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![probe_media, export_video, api_key_status, save_api_key, remove_api_key, auto_cut, auto_cut_timeline, travel_edit])
+        .invoke_handler(tauri::generate_handler![probe_media, export_video, api_key_status, save_api_key, remove_api_key, auto_cut, auto_cut_timeline, travel_edit, list_fonts, caption_preview, auto_cut_prepare, auto_cut_render])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

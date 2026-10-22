@@ -73,6 +73,10 @@ pub struct PlanCaption {
     pub start: f64,
     pub end: f64,
     pub text: String,
+    /// Edited by the user: the words may differ from the transcript, so the "must match what is spoken"
+    /// check is skipped (it exists to catch captions invented by an AI planner).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trusted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,6 +381,14 @@ pub fn validate(plan: &EditPlan, t: &Transcript) -> Result<ValidatedPlan, Vec<St
             errors.push(format!("{tag}: {:.2}-{:.2} is not inside its segment {:.2}-{:.2}.", c.start, c.end, seg.start, seg.end));
             continue;
         }
+        if c.trusted {
+            captions.push(ValidCaption {
+                text: c.text.trim().to_string(),
+                out_start: seg.out_start + (a - seg.start),
+                out_end: seg.out_start + (b - seg.start),
+            });
+            continue;
+        }
         let spoken: Vec<String> = t
             .words
             .iter()
@@ -475,8 +487,8 @@ mod tests {
                 rationale: "um".into(), confidence: Confidence::High,
             }],
             captions: vec![
-                PlanCaption { segment_index: 0, start: 3.0, end: 3.9, text: "Sobrang dali".into() },
-                PlanCaption { segment_index: 2, start: 6.0, end: 6.8, text: "Salamat!".into() },
+                PlanCaption { segment_index: 0, start: 3.0, end: 3.9, text: "Sobrang dali".into(), trusted: false },
+                PlanCaption { segment_index: 2, start: 6.0, end: 6.8, text: "Salamat!".into(), trusted: false },
             ],
         }
     }

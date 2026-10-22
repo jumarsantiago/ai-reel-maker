@@ -12,6 +12,8 @@ use crate::plan::{normalize, Confidence, EditPlan, PlanCaption, PlanRemoval, Pla
 use crate::transcribe::{Transcript, Word};
 
 pub const MAX_GAP_SEC: f64 = 0.4;
+/// Must match the validator's minimum segment length (plan.rs), with a hair of margin for rounding.
+const MIN_SEGMENT_SEC: f64 = 0.32;
 const PAD_SEC: f64 = 0.08;
 const MAX_PHRASE: usize = 4;
 /// How many words may sit between a phrase and its restart for it to count as a false start.
@@ -70,7 +72,7 @@ fn classify(words: &[Word]) -> Vec<Why> {
 
 pub fn auto_plan(t: &Transcript) -> EditPlan {
     let w = &t.words;
-    let why = classify(w);
+    let mut why = classify(w);
     let dur = t.duration_sec;
 
     // Group kept words into segments, splitting where a removed word or a long pause sits between.
@@ -90,15 +92,37 @@ pub fn auto_plan(t: &Transcript) -> EditPlan {
         }
     }
 
-    // Segment edges: pad into the silence, but never past halfway to a neighbouring word.
+    // Segment edges: pad into the silence, but never past halfway to a neighbouring word. A group that is
+    // still shorter than the validator's minimum segment is widened into the silence around it; if there is
+    // no room (a stray "uh-uh" squeezed between words), it is dropped and its words count as removed, so the
+    // plan always validates and caption segment indexes stay aligned.
     let mut segments = Vec::new();
     let mut bounds: Vec<(f64, f64)> = Vec::new();
-    for g in &groups {
+    let mut kept_groups: Vec<Vec<usize>> = Vec::new();
+    for g in groups {
         let (a, b) = (g[0], *g.last().expect("non-empty"));
         let prev_end = if a > 0 { w[a - 1].end } else { 0.0 };
         let next_start = if b + 1 < w.len() { w[b + 1].start } else { dur };
-        let start = (w[a].start - PAD_SEC).max((prev_end + w[a].start) / 2.0).max(0.0);
-        let end = (w[b].end + PAD_SEC).min((w[b].end + next_start) / 2.0).min(dur);
+        let lo = ((prev_end + w[a].start) / 2.0).max(0.0);
+        let hi = ((w[b].end + next_start) / 2.0).min(dur);
+        let mut start = (w[a].start - PAD_SEC).max(lo);
+        let mut end = (w[b].end + PAD_SEC).min(hi);
+        if end - start < MIN_SEGMENT_SEC {
+            let grow = (MIN_SEGMENT_SEC - (end - start)) / 2.0;
+            start = (start - grow).max(lo);
+            end = (end + grow).min(hi);
+            // One side may have hit its limit; give the leftover to the other.
+            if end - start < MIN_SEGMENT_SEC {
+                start = (end - MIN_SEGMENT_SEC).max(lo);
+                end = (start + MIN_SEGMENT_SEC).min(hi);
+            }
+        }
+        if round2(end) - round2(start) < MIN_SEGMENT_SEC {
+            for &i in &g {
+                why[i] = Why::Filler;
+            }
+            continue;
+        }
         let text: Vec<&str> = g.iter().map(|&i| w[i].text.as_str()).collect();
         segments.push(PlanSegment {
             source_id: t.source_id.clone(),
@@ -109,7 +133,9 @@ pub fn auto_plan(t: &Transcript) -> EditPlan {
             confidence: Confidence::High,
         });
         bounds.push((round2(start), round2(end)));
+        kept_groups.push(g);
     }
+    let groups = kept_groups;
 
     // Removals = everything between kept segments that contains removed words or a long pause.
     let mut removals = Vec::new();
@@ -312,6 +338,76 @@ mod tests {
         assert_eq!(kept_text(&t, &p), "sobrang dali lang nito ano ba a a promise");
         // Only the trailing silence may be cut - never words.
         assert!(p.removals.iter().all(|r| r.kind == "dead_air"), "{:?}", p.removals);
+    }
+
+    #[test]
+    fn lone_tiny_word_between_pauses_is_widened_and_the_plan_validates() {
+        // A burst of speech shorter than the minimum segment ("Uh-uh") used to be rejected by validation,
+        // which shifted every later caption onto the wrong segment.
+        let mut t = transcript(&[("Hello", 0.0), ("there.", 0.0), ("Uh-uh.", 1.5), ("Okay", 1.5), ("so", 0.0), ("yes.", 0.0), ("Hmm-mm.", 1.5), ("Bye", 1.5), ("now.", 0.0)]);
+        t.words[2].end = t.words[2].start + 0.05;
+        t.words[6].end = t.words[6].start + 0.1;
+        let p = auto_plan(&t);
+        let v = validate(&p, &t).unwrap_or_else(|e| panic!("plan rejected: {e:?}"));
+        assert_eq!(v.expected_words.join(" "), "hello there uhuh okay so yes hmmmm bye now");
+        assert_eq!(p.captions.len(), v.captions.len());
+    }
+
+    #[test]
+    fn tiny_word_squeezed_between_fillers_is_dropped_and_the_plan_validates() {
+        let mut t = transcript(&[("Hello", 0.0), ("there.", 0.0), ("um,", 0.0), ("yes.", 0.0), ("um,", 0.0), ("Okay", 0.0), ("so", 0.0), ("yes.", 0.0)]);
+        t.words[3].end = t.words[3].start + 0.05;
+        let p = auto_plan(&t);
+        let v = validate(&p, &t).unwrap_or_else(|e| panic!("plan rejected: {e:?}"));
+        assert_eq!(v.expected_words.join(" "), "hello there okay so yes");
+        assert_eq!(p.captions.len(), v.captions.len());
+        assert!(p.segments.iter().all(|s| s.end - s.start >= 0.3));
+    }
+
+    #[test]
+    fn random_transcripts_always_produce_a_valid_plan() {
+        // Tiny words, fillers, repeats and pauses in every combination must never make validation reject the plan.
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let pool = ["yes.", "um,", "Uh-uh.", "the", "the", "ano", "kasi", "hmm", "okay", "so", "bye", "how", "to", "make,", "ito"];
+        for case in 0..300 {
+            let n = 5 + (rnd() * 60.0) as usize;
+            let mut clock = 0.0;
+            let mut words = Vec::new();
+            for id in 0..n {
+                clock += if rnd() < 0.3 { rnd() * 2.0 } else { rnd() * 0.12 };
+                let len = if rnd() < 0.3 { 0.03 + rnd() * 0.2 } else { 0.15 + rnd() * 0.6 };
+                let text = pool[(rnd() * pool.len() as f64) as usize % pool.len()].to_string();
+                words.push(Word { id, text, start: clock, end: clock + len });
+                clock += len;
+            }
+            let t = Transcript {
+                source_id: "clip_1".into(),
+                duration_sec: clock + 0.3,
+                language_requested: "tl".into(),
+                languages_detected: vec![],
+                words,
+                silences: Vec::<Interval>::new(),
+                speech_chunks: vec![],
+                whisper_model: "test".into(),
+                timing_method: "test".into(),
+            };
+            let p = auto_plan(&t);
+            if p.segments.is_empty() {
+                continue;
+            }
+            match validate(&p, &t) {
+                Ok(v) => assert_eq!(v.captions.len(), p.captions.len(), "case {case}: captions dropped"),
+                // A reel that is only a fraction of a second long is rightly refused; that is not a plan bug.
+                Err(e) if e.len() == 1 && e[0].contains("would be only") => {}
+                Err(e) => panic!("case {case}: plan rejected: {:?}", &e[..e.len().min(4)]),
+            }
+        }
     }
 
     #[test]

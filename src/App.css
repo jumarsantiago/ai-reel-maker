@@ -111,4 +111,15 @@ dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; 
 .check input { accent-color: var(--accent); }
 .music-row { display: flex; align-items: center; gap: 6px; margin-top: 10px; font-size: 13px; min-width: 0; }
 .music-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.extras-box { display: grid; gap: 10px; margin-top: 14px; font-size: 13px; }
+.extras-box .field input, .extras-box .field textarea { background: #0f1115; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font: inherit; font-size: 12px; }
+.extras-box .field textarea { resize: vertical; font-family: inherit; }
+.extras-box .field input:focus-visible, .extras-box .field textarea:focus-visible { outline: 2px solid var(--accent); }
 .btn.small { padding: 3px 8px; font-size: 12px; }
+
+/* Edit mode switch and travel options */
+.mode-row { display: flex; gap: 6px; margin-bottom: 12px; }
+.mode-row .btn { flex: 1; }
+.btn.small.active { background: var(--accent); color: #0f1115; border-color: var(--accent); }
+.travel-grid { display: grid; gap: 10px; margin-top: 12px; }
+.travel-grid .field select { background: #0f1115; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font: inherit; font-size: 12px; }

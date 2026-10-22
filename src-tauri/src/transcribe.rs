@@ -50,7 +50,13 @@ pub fn default_model_path() -> PathBuf {
         return PathBuf::from(p);
     }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    home.join("Library/Application Support/ai-reel-maker/models/ggml-small.bin")
+    let dir = home.join("Library/Application Support/ai-reel-maker/models");
+    // Best installed model first: large-v3 spells Taglish much better than small.
+    ["ggml-large-v3.bin", "ggml-large-v3-turbo.bin", "ggml-medium.bin", "ggml-small.bin"]
+        .iter()
+        .map(|f| dir.join(f))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| dir.join("ggml-small.bin"))
 }
 
 /// Parses FFmpeg `silencedetect` stderr. A trailing open silence runs to `duration`.
@@ -269,7 +275,9 @@ pub fn refine_words(words: &[RawWord], env: &[f64], chunk: Interval) -> Vec<(Str
 /// whisper.cpp DTW presets are named after the model ("small", "base.en", ...).
 pub fn dtw_preset(model: &Path) -> Option<String> {
     let name = model.file_name()?.to_string_lossy();
-    let preset = name.strip_prefix("ggml-")?.strip_suffix(".bin")?;
+    // whisper.cpp spells the large models "large-v3" in file names but "large.v3" as a DTW preset.
+    let preset = name.strip_prefix("ggml-")?.strip_suffix(".bin")?.replace("large-", "large.").replace("-turbo", ".turbo");
+    let preset = preset.as_str();
     const KNOWN: &[&str] = &["tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en", "large.v1", "large.v2", "large.v3", "large.v3.turbo"];
     KNOWN.contains(&preset).then(|| preset.to_string())
 }
@@ -453,6 +461,8 @@ mod tests {
     fn dtw_presets_follow_model_names() {
         assert_eq!(dtw_preset(Path::new("/m/ggml-small.bin")).as_deref(), Some("small"));
         assert_eq!(dtw_preset(Path::new("/m/ggml-base.en.bin")).as_deref(), Some("base.en"));
+        assert_eq!(dtw_preset(Path::new("/m/ggml-large-v3.bin")).as_deref(), Some("large.v3"));
+        assert_eq!(dtw_preset(Path::new("/m/ggml-large-v3-turbo.bin")).as_deref(), Some("large.v3.turbo"));
         assert_eq!(dtw_preset(Path::new("/m/custom.bin")), None);
     }
 

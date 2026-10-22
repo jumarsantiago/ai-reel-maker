@@ -36,6 +36,7 @@ type ExportState =
   | { kind: "error"; message: string };
 
 type AutoCutResult = {
+  mode: "talk" | "travel";
   projectDir: string;
   outputPath: string;
   durationSec: number;
@@ -55,6 +56,32 @@ type EditStyle = {
   loudness: boolean;
   music: string | null;
 };
+
+type TravelDraft = {
+  clipSec: number;
+  transition: "smooth" | "dynamic" | "none";
+  grade: "warm" | "vivid" | "natural";
+  pan: boolean;
+  fade: boolean;
+};
+
+type ExtrasDraft = { hook: string; tags: string; cta: string };
+
+// One tag per line: "TEXT" or "TEXT | phrase said in the video" (the tag appears when that phrase is spoken).
+function toExtras(d: ExtrasDraft) {
+  const tags = d.tags
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [text, phrase] = line.split("|").map((x) => x.trim());
+      return phrase ? { text, phrase } : { text };
+    });
+  const hook = d.hook.trim();
+  const cta = d.cta.trim();
+  if (!hook && !cta && tags.length === 0) return null;
+  return { hook: hook || null, tags, cta: cta || null };
+}
 
 const MUSIC_EXTENSIONS = ["mp3", "m4a", "aac", "wav", "aif", "aiff", "flac"];
 
@@ -101,6 +128,9 @@ function App() {
     loudness: true,
     music: null,
   });
+  const [editMode, setEditMode] = useState<"talk" | "travel">("talk");
+  const [travelDraft, setTravelDraft] = useState<TravelDraft>({ clipSec: 4, transition: "smooth", grade: "warm", pan: true, fade: true });
+  const [extrasDraft, setExtrasDraft] = useState<ExtrasDraft>({ hook: "", tags: "", cta: "" });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [keyStatus, setKeyStatus] = useState<KeyStatus | null>(null);
   const [keyInput, setKeyInput] = useState("");
@@ -234,7 +264,32 @@ function App() {
   }
 
   async function runAutoCut(m: MediaInfo) {
-    setAutoCut({ kind: "running", source: m.fileName, stage: "Starting…", progress: 0 });
+    await startAutoCut(m.fileName, "auto_cut", { path: m.path });
+  }
+
+  async function runAutoCutTimeline() {
+    const planned = toRenderPlan(clips);
+    if (!planned.ok) {
+      setAutoCut({ kind: "error", message: planned.error });
+      return;
+    }
+    const segments = planned.segments.map((sg) => ({ sourcePath: sg.sourcePath, inPoint: sg.inPoint, outPoint: sg.outPoint }));
+    await startAutoCut(`Timeline: ${plural(clips.length, "clip")}`, "auto_cut_timeline", { segments });
+  }
+
+  async function runTravel() {
+    const planned = toRenderPlan(clips);
+    if (!planned.ok) {
+      setAutoCut({ kind: "error", message: planned.error });
+      return;
+    }
+    const segments = planned.segments.map((sg) => ({ sourcePath: sg.sourcePath, inPoint: sg.inPoint, outPoint: sg.outPoint }));
+    const style = { ...travelDraft, music: editStyle.music };
+    await startAutoCut(`Travel reel: ${plural(clips.length, "clip")}`, "travel_edit", { segments, style }, false);
+  }
+
+  async function startAutoCut(source: string, command: string, args: Record<string, unknown>, withStyle = true) {
+    setAutoCut({ kind: "running", source, stage: "Starting…", progress: 0 });
     const offStage = await listen<string>("autocut-stage", (e) =>
       setAutoCut((s) => (s.kind === "running" ? { ...s, stage: e.payload } : s)),
     );
@@ -242,7 +297,7 @@ function App() {
       setAutoCut((s) => (s.kind === "running" ? { ...s, progress: e.payload } : s)),
     );
     try {
-      const result = await invoke<AutoCutResult>("auto_cut", { path: m.path, style: editStyle });
+      const result = await invoke<AutoCutResult>(command, { ...(withStyle ? { style: editStyle } : {}), ...args, extras: toExtras(extrasDraft) });
       setAutoCut({ kind: "done", result });
     } catch (e) {
       setAutoCut({ kind: "error", message: String(e) });
@@ -320,6 +375,171 @@ function App() {
 
   const total = totalDuration(clips);
   const rendering = exportState.kind === "rendering";
+
+  const timelineMode = clips.length > 0;
+  const audioOk = timelineMode
+    ? clips.some((c) => media.find((m) => m.path === c.sourcePath)?.hasAudio)
+    : !!selectedMedia?.hasAudio;
+  const musicRow = (
+                <div className="music-row">
+                  <span className="muted">Music:</span>
+                  <span className="music-name" title={editStyle.music ?? ""}>
+                    {editStyle.music ? editStyle.music.split("/").pop() : "none"}
+                  </span>
+                  <button className="btn small" onClick={chooseMusic}>Choose…</button>
+                  {editStyle.music && (
+                    <button className="btn small" onClick={() => setEditStyle((st) => ({ ...st, music: null }))} aria-label="Remove music">
+                      ✕
+                    </button>
+                  )}
+                </div>
+  );
+  const extrasBox = (
+                <div className="extras-box">
+                  <span className="muted">Hook, tags &amp; CTA (optional):</span>
+                  <label className="field">
+                    Hook (first 3 seconds)
+                    <input
+                      type="text"
+                      placeholder="NANGANGALAY NA KAMAY MO SA 8 HRS NA TRABAHO?"
+                      value={extrasDraft.hook}
+                      onChange={(e) => setExtrasDraft((d) => ({ ...d, hook: e.target.value }))}
+                    />
+                  </label>
+                  <label className="field">
+                    Tags, one per line. Add "| phrase" to show it when that phrase is said
+                    <textarea
+                      rows={4}
+                      placeholder={"LOGITECH ERGONOMIC MOUSE | logitech\nBLUETOOTH + LAPTOP + DESKTOP | bluetooth\nCLEAN WHITE DESIGN"}
+                      value={extrasDraft.tags}
+                      onChange={(e) => setExtrasDraft((d) => ({ ...d, tags: e.target.value }))}
+                    />
+                  </label>
+                  <label className="field">
+                    CTA (last 3.5 seconds)
+                    <input
+                      type="text"
+                      placeholder="CLICK THE YELLOW BASKET"
+                      value={extrasDraft.cta}
+                      onChange={(e) => setExtrasDraft((d) => ({ ...d, cta: e.target.value }))}
+                    />
+                  </label>
+                </div>
+  );
+  const travelPanel = (
+    <>
+      <button
+        className="btn primary wide"
+        onClick={runTravel}
+        disabled={autoCut.kind === "running" || !timelineMode}
+        title={timelineMode ? "Join the timeline clips into a vertical travel reel" : "Add clips to the timeline first"}
+      >
+        {timelineMode ? `🌴 Make travel reel (${plural(clips.length, "clip")})` : "🌴 Make travel reel"}
+      </button>
+      <p className="muted small-note">
+        {timelineMode
+          ? "For footage without speech: nothing is cut for silence. Each clip keeps its best seconds, then they are joined with transitions. Add your voice-over afterwards in CapCut."
+          : "Add your clips to the timeline with the + button first."}
+      </p>
+      <div className="travel-grid">
+        <label className="field">
+          Longest per clip
+          <select value={travelDraft.clipSec} onChange={(e) => setTravelDraft((d) => ({ ...d, clipSec: Number(e.target.value) }))}>
+            <option value={2.5}>2.5 s (fast)</option>
+            <option value={3}>3 s</option>
+            <option value={4}>4 s</option>
+            <option value={5}>5 s</option>
+            <option value={6}>6 s</option>
+            <option value={0}>Keep my trims</option>
+          </select>
+        </label>
+        <label className="field">
+          Transition
+          <select value={travelDraft.transition} onChange={(e) => setTravelDraft((d) => ({ ...d, transition: e.target.value as TravelDraft["transition"] }))}>
+            <option value="smooth">Smooth fade</option>
+            <option value="dynamic">Dynamic mix</option>
+            <option value="none">None (hard cut)</option>
+          </select>
+        </label>
+        <label className="field">
+          Color look
+          <select value={travelDraft.grade} onChange={(e) => setTravelDraft((d) => ({ ...d, grade: e.target.value as TravelDraft["grade"] }))}>
+            <option value="warm">Warm travel</option>
+            <option value="vivid">Vivid</option>
+            <option value="natural">Natural</option>
+          </select>
+        </label>
+      </div>
+      <div className="style-options">
+        <label className="check">
+          <input type="checkbox" checked={travelDraft.pan} onChange={(e) => setTravelDraft((d) => ({ ...d, pan: e.target.checked }))} />
+          Slow drift on each clip
+        </label>
+        <label className="check">
+          <input type="checkbox" checked={travelDraft.fade} onChange={(e) => setTravelDraft((d) => ({ ...d, fade: e.target.checked }))} />
+          Fade in and out
+        </label>
+      </div>
+      {musicRow}
+      {extrasBox}
+    </>
+  );
+  const autoEditBox = (
+          <div className="auto-cut-box">
+            <div className="mode-row" role="group" aria-label="Edit mode">
+              <button className={`btn small${editMode === "talk" ? " active" : ""}`} onClick={() => setEditMode("talk")} aria-pressed={editMode === "talk"}>
+                Talking video
+              </button>
+              <button className={`btn small${editMode === "travel" ? " active" : ""}`} onClick={() => setEditMode("travel")} aria-pressed={editMode === "travel"}>
+                Travel b-roll
+              </button>
+            </div>
+            {editMode === "travel" ? travelPanel : (
+            <>
+            <button
+              className="btn primary wide"
+              onClick={timelineMode ? runAutoCutTimeline : () => selectedMedia && runAutoCut(selectedMedia)}
+              disabled={autoCut.kind === "running" || !audioOk}
+              title={audioOk ? "Cut, zoom, add sounds and captions automatically" : "Needs a video with speech"}
+            >
+              {timelineMode ? `✨ Auto Edit timeline (${plural(clips.length, "clip")})` : "✨ Auto Edit (free, no AI)"}
+            </button>
+            {timelineMode && (
+              <p className="muted small-note">Joins every clip on the timeline in order (with your trims), then edits it as one reel.</p>
+            )}
+            {audioOk ? (
+              <>
+                <div className="style-options">
+                  {([
+                    ["zoom", "Zoom on cuts"],
+                    ["soundEffects", "Whoosh on cuts"],
+                    ["highlightWords", "Highlight spoken word"],
+                    ["loudness", "Even out volume"],
+                  ] as const).map(([key, label]) => (
+                    <label key={key} className="check">
+                      <input
+                        type="checkbox"
+                        checked={editStyle[key]}
+                        onChange={(e) => setEditStyle((st) => ({ ...st, [key]: e.target.checked }))}
+                      />
+                      {label}
+                    </label>
+                  ))}
+                </div>
+                {musicRow}
+                {extrasBox}
+                <p className="muted small-note">
+                  Cuts pauses, um/uh and repeats, then makes a 9:16 reel with captions. Runs on this Mac. Use music you
+                  have the rights to.
+                </p>
+              </>
+            ) : (
+              <p className="muted small-note">This video has no audio, so there is nothing to transcribe.</p>
+            )}
+            </>
+            )}
+          </div>
+  );
 
   return (
     <div className="app">
@@ -441,59 +661,11 @@ function App() {
             <dt>Audio</dt><dd>{selectedMedia.hasAudio ? "Yes" : "None"}</dd>
             <dt>Size</dt><dd>{formatSize(selectedMedia.sizeBytes)}</dd>
           </dl>
-          <div className="auto-cut-box">
-            <button
-              className="btn primary wide"
-              onClick={() => runAutoCut(selectedMedia)}
-              disabled={autoCut.kind === "running" || !selectedMedia.hasAudio}
-              title={selectedMedia.hasAudio ? "Cut, zoom, add sounds and captions automatically" : "Needs a video with speech"}
-            >
-              ✨ Auto Edit (free, no AI)
-            </button>
-            {selectedMedia.hasAudio ? (
-              <>
-                <div className="style-options">
-                  {([
-                    ["zoom", "Zoom on cuts"],
-                    ["soundEffects", "Whoosh on cuts"],
-                    ["highlightWords", "Highlight spoken word"],
-                    ["loudness", "Even out volume"],
-                  ] as const).map(([key, label]) => (
-                    <label key={key} className="check">
-                      <input
-                        type="checkbox"
-                        checked={editStyle[key]}
-                        onChange={(e) => setEditStyle((st) => ({ ...st, [key]: e.target.checked }))}
-                      />
-                      {label}
-                    </label>
-                  ))}
-                </div>
-                <div className="music-row">
-                  <span className="muted">Music:</span>
-                  <span className="music-name" title={editStyle.music ?? ""}>
-                    {editStyle.music ? editStyle.music.split("/").pop() : "none"}
-                  </span>
-                  <button className="btn small" onClick={chooseMusic}>Choose…</button>
-                  {editStyle.music && (
-                    <button className="btn small" onClick={() => setEditStyle((st) => ({ ...st, music: null }))} aria-label="Remove music">
-                      ✕
-                    </button>
-                  )}
-                </div>
-                <p className="muted small-note">
-                  Cuts pauses, um/uh and repeats, then makes a 9:16 reel with captions. Runs on this Mac. Use music you
-                  have the rights to.
-                </p>
-              </>
-            ) : (
-              <p className="muted small-note">This video has no audio, so there is nothing to transcribe.</p>
-            )}
-          </div>
           </>
         ) : (
           <p className="muted">Select a clip to see its details.</p>
         )}
+        {(timelineMode || selectedMedia) && autoEditBox}
       </aside>
 
       <footer className="panel timeline">
@@ -548,14 +720,22 @@ function App() {
                   <dd>
                     {formatTime(autoCut.result.durationSec)} (from {formatTime(autoCut.result.sourceDurationSec)})
                   </dd>
-                  <dt>Removed</dt>
-                  <dd>
-                    {plural(autoCut.result.pausesRemoved, "pause")} · {plural(autoCut.result.fillersRemoved, "filler")} ·{" "}
-                    {plural(autoCut.result.repeatsRemoved, "repeat")}
-                  </dd>
-                  <dt>Captions</dt><dd>{autoCut.result.captions}</dd>
-                  <dt>Check</dt>
-                  <dd>{Math.round(autoCut.result.keptWordsMatch * 100)}% of kept words heard in the result</dd>
+                  {autoCut.result.mode === "travel" ? (
+                    <>
+                      <dt>Clips</dt><dd>{autoCut.result.segments}</dd>
+                    </>
+                  ) : (
+                    <>
+                      <dt>Removed</dt>
+                      <dd>
+                        {plural(autoCut.result.pausesRemoved, "pause")} · {plural(autoCut.result.fillersRemoved, "filler")} ·{" "}
+                        {plural(autoCut.result.repeatsRemoved, "repeat")}
+                      </dd>
+                      <dt>Captions</dt><dd>{autoCut.result.captions}</dd>
+                      <dt>Check</dt>
+                      <dd>{Math.round(autoCut.result.keptWordsMatch * 100)}% of kept words heard in the result</dd>
+                    </>
+                  )}
                 </dl>
                 <div className="btn-row">
                   <button className="btn primary" onClick={() => addResultToMedia(autoCut.result.outputPath)}>

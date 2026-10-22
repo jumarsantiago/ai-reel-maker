@@ -7,12 +7,26 @@ use ab_glyph::{point, Font, FontVec, PxScale, ScaleFont};
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_FONT: &str = "/System/Library/Fonts/Supplemental/Arial Bold.ttf";
+/// Rounded sans used by the soft look (ships with macOS).
+pub const SOFT_FONT: &str = "/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf";
+
+/// Rounded background behind a caption (the soft, aesthetic look).
+#[derive(Clone, Copy)]
+pub struct Pill {
+    pub bg: [u8; 4],
+    pub border: [u8; 4],
+    pub border_px: f32,
+    pub radius: f32,
+}
 
 pub struct CaptionStyle {
     pub font_px: f32,
     pub max_width: u32,
     pub outline_px: u32,
     pub padding: u32,
+    pub text_rgb: [u8; 3],
+    pub highlight_rgb: [u8; 3],
+    pub pill: Option<Pill>,
 }
 
 pub const HIGHLIGHT_RGB: [u8; 3] = [255, 212, 0];
@@ -26,6 +40,66 @@ impl CaptionStyle {
             max_width: (frame_width as f32 * 0.88) as u32,
             outline_px: (9.0 * s).round().max(2.0) as u32,
             padding: (12.0 * s) as u32,
+            text_rgb: [255, 255, 255],
+            highlight_rgb: HIGHLIGHT_RGB,
+            pill: None,
+        }
+    }
+
+    /// Soft, aesthetic captions: cream text on a translucent plum pill with a thin cream edge and a
+    /// peach-rose highlight. Readable on light and dark footage, without a heavy outline.
+    pub fn reels_soft(frame_width: u32) -> Self {
+        let s = frame_width as f32 / 1080.0;
+        Self {
+            font_px: 88.0 * s,
+            max_width: (frame_width as f32 * 0.86) as u32,
+            outline_px: 0,
+            padding: (30.0 * s) as u32,
+            text_rgb: [255, 248, 242],
+            highlight_rgb: [255, 190, 165],
+            pill: Some(Pill { bg: [88, 52, 68, 208], border: [255, 240, 235, 150], border_px: 2.5 * s, radius: 44.0 * s }),
+        }
+    }
+
+    /// Big hook text for the first seconds: white on a deep rose pill.
+    pub fn hook(frame_width: u32) -> Self {
+        let s = frame_width as f32 / 1080.0;
+        Self {
+            font_px: 70.0 * s,
+            max_width: (frame_width as f32 * 0.88) as u32,
+            outline_px: 0,
+            padding: (32.0 * s) as u32,
+            text_rgb: [255, 255, 255],
+            highlight_rgb: [255, 255, 255],
+            pill: Some(Pill { bg: [176, 68, 98, 235], border: [255, 240, 235, 190], border_px: 3.0 * s, radius: 46.0 * s }),
+        }
+    }
+
+    /// Small feature tag: plum text on a cream pill.
+    pub fn tag(frame_width: u32) -> Self {
+        let s = frame_width as f32 / 1080.0;
+        Self {
+            font_px: 46.0 * s,
+            max_width: (frame_width as f32 * 0.86) as u32,
+            outline_px: 0,
+            padding: (22.0 * s) as u32,
+            text_rgb: [88, 52, 68],
+            highlight_rgb: [88, 52, 68],
+            pill: Some(Pill { bg: [255, 244, 236, 238], border: [214, 160, 150, 220], border_px: 2.5 * s, radius: 36.0 * s }),
+        }
+    }
+
+    /// Closing call to action: bigger plum text on a cream pill with a rose edge.
+    pub fn cta(frame_width: u32) -> Self {
+        let s = frame_width as f32 / 1080.0;
+        Self {
+            font_px: 58.0 * s,
+            max_width: (frame_width as f32 * 0.86) as u32,
+            outline_px: 0,
+            padding: (30.0 * s) as u32,
+            text_rgb: [88, 52, 68],
+            highlight_rgb: [88, 52, 68],
+            pill: Some(Pill { bg: [255, 244, 236, 245], border: [176, 68, 98, 255], border_px: 4.0 * s, radius: 44.0 * s }),
         }
     }
 
@@ -37,12 +111,20 @@ impl CaptionStyle {
             max_width: (frame_width as f32 * 0.86) as u32,
             outline_px: (7.0 * s).round().max(2.0) as u32,
             padding: (12.0 * s) as u32,
+            text_rgb: [255, 255, 255],
+            highlight_rgb: HIGHLIGHT_RGB,
+            pill: None,
         }
     }
 }
 
 pub fn load_font() -> Result<FontVec, String> {
-    let path = std::env::var_os("AIRM_CAPTION_FONT").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(DEFAULT_FONT));
+    load_font_for(DEFAULT_FONT)
+}
+
+/// `AIRM_CAPTION_FONT` always wins; otherwise `default_path`.
+pub fn load_font_for(default_path: &str) -> Result<FontVec, String> {
+    let path = std::env::var_os("AIRM_CAPTION_FONT").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(default_path));
     let bytes = std::fs::read(&path).map_err(|e| format!("Cannot read caption font {}: {e}", path.display()))?;
     FontVec::try_from_vec(bytes).map_err(|_| format!("Invalid font file {}", path.display()))
 }
@@ -98,6 +180,24 @@ fn dilate(mask: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
         }
     }
     out
+}
+
+/// Colour and alpha (0..1) of the rounded pill at pixel centre (x, y) of a w x h image.
+fn pill_pixel(p: &Pill, x: f32, y: f32, w: f32, h: f32) -> (f32, f32, f32, f32) {
+    let (hx, hy) = (w / 2.0, h / 2.0);
+    let r = p.radius.min(hx).min(hy);
+    let (qx, qy) = ((x - hx).abs() - (hx - r), (y - hy).abs() - (hy - r));
+    let d = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r;
+    let cover = (0.5 - d).clamp(0.0, 1.0);
+    let ring = ((d + p.border_px + 0.5).clamp(0.0, 1.0)) * cover;
+    let fa = p.bg[3] as f32 / 255.0 * cover;
+    let ba = p.border[3] as f32 / 255.0 * ring;
+    let oa = ba + fa * (1.0 - ba);
+    if oa <= 0.0 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let c = |k: usize| (p.border[k] as f32 * ba + p.bg[k] as f32 * fa * (1.0 - ba)) / oa;
+    (c(0), c(1), c(2), oa)
 }
 
 /// Renders one caption to an RGBA PNG; returns its pixel size.
@@ -167,14 +267,31 @@ pub fn render_words_png(font: &FontVec, style: &CaptionStyle, text: &str, highli
     let outline = dilate(&mask, w, h, style.outline_px as usize);
     let mut img = image::RgbaImage::new(w as u32, h as u32);
     for (i, px) in img.pixels_mut().enumerate() {
-        let a = outline[i].max(mask[i]);
+        // Glyph colour/coverage: text colour where white glyphs are, highlight colour where highlighted.
+        let ga = mask[i];
+        let (wf, yf) = if ga > 0.0 { (white[i] / ga, yellow[i] / ga) } else { (0.0, 0.0) };
+        let gc = |k: usize| style.text_rgb[k] as f32 * wf + style.highlight_rgb[k] as f32 * yf;
+        let (br, bg, bb, ba) = match &style.pill {
+            Some(p) => pill_pixel(p, (i % w) as f32 + 0.5, (i / w) as f32 + 0.5, w as f32, h as f32),
+            None => (0.0, 0.0, 0.0, 0.0),
+        };
+        if style.pill.is_some() {
+            let oa = ga + ba * (1.0 - ga);
+            if oa <= 0.0 {
+                *px = image::Rgba([0, 0, 0, 0]);
+            } else {
+                let mix = |g: f32, b: f32| ((g * ga + b * ba * (1.0 - ga)) / oa).clamp(0.0, 255.0).round() as u8;
+                *px = image::Rgba([mix(gc(0), br), mix(gc(1), bg), mix(gc(2), bb), (oa * 255.0).round() as u8]);
+            }
+            continue;
+        }
+        let a = outline[i].max(ga);
         if a <= 0.0 {
             *px = image::Rgba([0, 0, 0, 0]);
             continue;
         }
         // Straight alpha: glyph colour where the glyph is, black outline around it.
-        let (wf, yf) = (white[i] / a, yellow[i] / a);
-        let ch = |k: usize| ((255.0 * wf + HIGHLIGHT_RGB[k] as f32 * yf).min(255.0)).round() as u8;
+        let ch = |k: usize| ((style.text_rgb[k] as f32 * (white[i] / a) + style.highlight_rgb[k] as f32 * (yellow[i] / a)).min(255.0)).round() as u8;
         *px = image::Rgba([ch(0), ch(1), ch(2), (a * 255.0).round() as u8]);
     }
     img.save(out).map_err(|e| format!("Cannot write caption image: {e}"))?;

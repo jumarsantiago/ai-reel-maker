@@ -132,21 +132,28 @@ pub struct EditStyle {
     pub sound_effects: bool,
     /// Highlight the word being spoken in yellow.
     pub highlight_words: bool,
+    /// Soft pill captions (cream text on translucent plum, rounded font) instead of the classic outlined look.
+    #[serde(default = "default_soft_captions")]
+    pub soft_captions: bool,
     /// Normalize to -14 LUFS.
     pub loudness: bool,
     /// Optional background music file (looped, ducked under speech).
     pub music: Option<String>,
 }
 
+fn default_soft_captions() -> bool {
+    true
+}
+
 impl Default for EditStyle {
     fn default() -> Self {
-        Self { zoom: true, sound_effects: true, highlight_words: true, loudness: true, music: None }
+        Self { zoom: true, sound_effects: true, highlight_words: true, soft_captions: true, loudness: true, music: None }
     }
 }
 
 impl EditStyle {
     pub fn plain() -> Self {
-        Self { zoom: false, sound_effects: false, highlight_words: false, loudness: false, music: None }
+        Self { zoom: false, sound_effects: false, highlight_words: false, soft_captions: false, loudness: false, music: None }
     }
 }
 
@@ -269,8 +276,12 @@ pub fn render_plan(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: 
         std::fs::remove_dir_all(&cap_dir).map_err(|e| e.to_string())?; // our own generated PNGs only
     }
     std::fs::create_dir_all(&cap_dir).map_err(|e| e.to_string())?;
-    let font = captions::load_font()?;
-    let cap_style = if look.highlight_words { CaptionStyle::reels(settings.width) } else { CaptionStyle::for_width(settings.width) };
+    let font = if look.soft_captions { captions::load_font_for(captions::SOFT_FONT)? } else { captions::load_font()? };
+    let cap_style = match (look.soft_captions, look.highlight_words) {
+        (true, _) => CaptionStyle::reels_soft(settings.width),
+        (false, true) => CaptionStyle::reels(settings.width),
+        (false, false) => CaptionStyle::for_width(settings.width),
+    };
     let mut overlays = Vec::new();
     for (i, c) in v.captions.iter().enumerate() {
         if look.highlight_words {
@@ -287,6 +298,15 @@ pub fn render_plan(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: 
             captions::render_png(&font, &cap_style, &c.text, &png)?;
             overlays.push(Overlay { image: png, start: c.out_start, end: c.out_end, y_center_frac: CAPTION_Y_FRAC });
         }
+    }
+    if let Some(extras) = crate::extras::load(dir)? {
+        let (placed, notes) = crate::extras::place(&extras, &v.captions, v.total_sec);
+        for n in &notes {
+            log(dir, &format!("extras: {n}"));
+        }
+        log(dir, &format!("extras: {} overlay(s)", placed.len()));
+        let xfont = captions::load_font_for(captions::SOFT_FONT)?;
+        overlays.extend(crate::extras::overlays(&xfont, &placed, settings.width, &cap_dir)?);
     }
     let srt_path = next_free(dir, "output", "srt");
     std::fs::write(&srt_path, captions::to_srt(&v.captions)).map_err(|e| e.to_string())?;
@@ -322,6 +342,7 @@ pub fn render_plan(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: 
             sfx,
             music: music.map(|path| render::Music { path, gain_db: MUSIC_GAIN_DB }),
             loudnorm: look.loudness,
+            ..Default::default()
         },
     };
     let out_path = next_free(dir, "output", "mp4");
@@ -361,11 +382,27 @@ pub fn auto_cut(
     stage: impl Fn(&str),
     on_progress: impl Fn(f64),
 ) -> Result<(PathBuf, RenderReport), String> {
+    auto_cut_with(video, root, language, look, None, stage, on_progress)
+}
+
+/// Like [`auto_cut`], plus an optional hook / tags / CTA (saved as `extras.json` in the project folder).
+pub fn auto_cut_with(
+    video: &str,
+    root: &Path,
+    language: &str,
+    look: &EditStyle,
+    extras: Option<&crate::extras::Extras>,
+    stage: impl Fn(&str),
+    on_progress: impl Fn(f64),
+) -> Result<(PathBuf, RenderReport), String> {
     if let Some(m) = &look.music {
         check_music(m)?; // fail fast, before transcribing
     }
     stage("Transcribing…");
     let dir = prepare(video, root, language, &PlanSettings::default(), plan::DEFAULT_MODEL)?;
+    if let Some(x) = extras {
+        write_json(&dir.join("extras.json"), x)?;
+    }
     stage("Planning cuts…");
     let t: Transcript = read_json(&dir.join("transcript.json"))?;
     let edit = crate::autoplan::auto_plan(&t);
@@ -375,6 +412,37 @@ pub fn auto_cut(
     stage("Rendering…");
     let report = render_plan(&dir, &plan_path, look, on_progress)?;
     Ok((dir, report))
+}
+
+/// Auto Edit for several timeline clips (in timeline order, with their trims): joins them into one
+/// working video first, then runs the same auto-cut on it, so cuts, captions, hook, tags and CTA span the whole reel.
+pub fn auto_cut_timeline(
+    segments: &[crate::render::SegmentRequest],
+    root: &Path,
+    language: &str,
+    look: &EditStyle,
+    extras: Option<&crate::extras::Extras>,
+    stage: impl Fn(&str),
+    on_progress: impl Fn(f64),
+) -> Result<(PathBuf, RenderReport), String> {
+    if segments.is_empty() {
+        return Err("Timeline is empty. Add clips with the + button first.".into());
+    }
+    if let Some(m) = &look.music {
+        check_music(m)?;
+    }
+    stage(&format!("Joining {} clip(s)…", segments.len()));
+    let work = root.join("timeline-sources");
+    std::fs::create_dir_all(&work).map_err(|e| format!("Cannot create {}: {e}", work.display()))?;
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let joined = work.join(format!("timeline-{secs}.mp4"));
+    let req = crate::render::ExportRequest {
+        segments: segments.to_vec(),
+        output_path: joined.to_string_lossy().into_owned(),
+        overwrite_confirmed: false,
+    };
+    crate::render::export(&req, |_| {})?;
+    auto_cut_with(&joined.to_string_lossy(), root, language, look, extras, stage, on_progress)
 }
 
 #[cfg(test)]

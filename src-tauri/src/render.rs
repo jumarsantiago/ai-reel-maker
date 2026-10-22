@@ -72,6 +72,64 @@ pub struct Style {
     pub music: Option<Music>,
     /// Normalize the final mix to -14 LUFS (social-media loudness).
     pub loudnorm: bool,
+    /// Slow sideways drift on each clip (Crop fit only); replaces the punch-in zoom.
+    pub pan: bool,
+    pub grade: Grade,
+    /// Crossfade/slide between clips instead of a hard cut.
+    pub transition: Option<Transition>,
+    /// Music plays at a steady level instead of being ducked by the clips' own sound (b-roll).
+    pub music_no_duck: bool,
+    /// Level of the clips' own sound when music plays under it without ducking.
+    pub natural_gain_db: f64,
+    /// Fade the picture and sound in at the start and out at the end (seconds, 0 = none).
+    pub fade_sec: f64,
+}
+
+/// A simple colour look applied to every clip.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Grade {
+    #[default]
+    None,
+    Warm,
+    Vivid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TransitionStyle {
+    /// Soft cross-dissolve every time.
+    Smooth,
+    /// A varied mix of slides, zooms and wipes.
+    Dynamic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Transition {
+    pub style: TransitionStyle,
+    pub sec: f64,
+}
+
+const DYNAMIC_TRANSITIONS: &[&str] = &["slideleft", "zoomin", "smoothup", "circleopen", "fade", "slideright", "dissolve"];
+
+fn has_audio_track(plan: &Plan) -> bool {
+    // Music alone is enough: clips without sound get silence so the music still has a track to join.
+    plan.segments.iter().any(|s| s.has_audio) || plan.style.music.is_some()
+}
+
+/// Seconds each junction overlaps (0 = plain concat). Never more than 40% of the shortest clip.
+fn xfade_sec(plan: &Plan) -> f64 {
+    let Some(t) = plan.style.transition else { return 0.0 };
+    if plan.segments.len() < 2 {
+        return 0.0;
+    }
+    let shortest = plan.segments.iter().map(|s| s.length).fold(f64::INFINITY, f64::min);
+    let d = t.sec.min(shortest * 0.4);
+    if d < 0.05 { 0.0 } else { d }
+}
+
+/// Output length, accounting for the overlap at every crossfade.
+pub fn plan_total(plan: &Plan) -> f64 {
+    let sum: f64 = plan.segments.iter().map(|s| s.length).sum();
+    sum - xfade_sec(plan) * plan.segments.len().saturating_sub(1) as f64
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -193,21 +251,37 @@ fn secs(x: f64) -> String {
 
 pub fn build_filter_graph(plan: &Plan) -> String {
     let (w, h, fps) = (plan.width, plan.height, plan.fps);
-    let any_audio = plan.segments.iter().any(|s| s.has_audio);
+    let any_audio = has_audio_track(plan);
+    let xf = xfade_sec(plan);
+    let total = plan_total(plan);
     let mut graph = String::new();
     let mut concat_inputs = String::new();
     for (i, s) in plan.segments.iter().enumerate() {
         let frame = match plan.fit {
             Fit::Pad => format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"),
+            Fit::Crop if plan.style.pan => {
+                // Scale up 8% and drift across it: up to 70px each way over the clip, alternating direction.
+                let dir = if i % 2 == 0 { 1 } else { -1 };
+                format!(
+                    "scale={w}:{h}:force_original_aspect_ratio=increase,scale=trunc(iw*1.08/2)*2:trunc(ih*1.08/2)*2,\
+                     crop={w}:{h}:x='(iw-ow)/2+({dir})*min(70,(iw-ow)/2)*(2*t/{len}-1)':y='(ih-oh)/2'",
+                    len = secs(s.length)
+                )
+            }
             Fit::Crop => format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"),
         };
-        let z = plan.style.zoom.get(i).copied().unwrap_or(1.0);
+        let grade = match plan.style.grade {
+            Grade::None => "",
+            Grade::Warm => ",eq=contrast=1.06:saturation=1.2:gamma_r=1.04:gamma_b=0.95",
+            Grade::Vivid => ",eq=contrast=1.08:saturation=1.4",
+        };
+        let z = if plan.style.pan { 1.0 } else { plan.style.zoom.get(i).copied().unwrap_or(1.0) };
         let zoom = if plan.fit == Fit::Crop && z > 1.001 {
             format!(",scale={}:{},crop={w}:{h}", even((w as f64 * z).round() as u32), even((h as f64 * z).round() as u32))
         } else {
             String::new()
         };
-        graph += &format!("[{i}:v:0]setpts=PTS-STARTPTS,{frame}{zoom},setsar=1,fps={fps},format=yuv420p[v{i}];");
+        graph += &format!("[{i}:v:0]setpts=PTS-STARTPTS,{frame}{zoom}{grade},setsar=1,fps={fps},format=yuv420p[v{i}];");
         concat_inputs += &format!("[v{i}]");
         if any_audio {
             let len = secs(s.length);
@@ -226,11 +300,34 @@ pub fn build_filter_graph(plan: &Plan) -> String {
         }
     }
     let n = plan.segments.len();
-    let video_out = if plan.overlays.is_empty() { "[outv]" } else { "[cv]" };
+    let fade = plan.style.fade_sec.min(total / 3.0).max(0.0);
+    let vfade = if fade > 0.05 { format!("fade=t=in:st=0:d={f:.2},fade=t=out:st={o:.3}:d={f:.2}", f = fade, o = total - fade) } else { String::new() };
+    let video_out = if plan.overlays.is_empty() && vfade.is_empty() { "[outv]" } else { "[cv]" };
     let sfx_times = plan.style.sfx.as_ref().map(|x| x.times.as_slice()).unwrap_or(&[]);
-    let audio_post = any_audio && (plan.style.music.is_some() || !sfx_times.is_empty() || plan.style.loudnorm);
+    let audio_post = any_audio && (plan.style.music.is_some() || !sfx_times.is_empty() || plan.style.loudnorm || fade > 0.05);
     let audio_out = if audio_post { "[ca]" } else { "[outa]" };
-    if any_audio {
+    if xf > 0.0 {
+        // Crossfade every junction: overlapping video (xfade) and audio (acrossfade).
+        let mut acc = plan.segments[0].length;
+        let (mut pv, mut pa) = ("v0".to_string(), "a0".to_string());
+        for k in 1..n {
+            let kind = match plan.style.transition.map(|t| t.style) {
+                Some(TransitionStyle::Dynamic) => DYNAMIC_TRANSITIONS[(k - 1) % DYNAMIC_TRANSITIONS.len()],
+                _ => "fade",
+            };
+            let last = k == n - 1;
+            let lv = if last { video_out.trim_matches(['[', ']']).to_string() } else { format!("x{k}") };
+            graph += &format!("[{pv}][v{k}]xfade=transition={kind}:duration={xf:.3}:offset={o:.3}[{lv}];", o = acc - xf);
+            pv = lv;
+            if any_audio {
+                let la = if last { audio_out.trim_matches(['[', ']']).to_string() } else { format!("ax{k}") };
+                graph += &format!("[{pa}][a{k}]acrossfade=d={xf:.3}:c1=tri:c2=tri[{la}];");
+                pa = la;
+            }
+            acc += plan.segments[k].length - xf;
+        }
+        graph.pop(); // trailing ';'
+    } else if any_audio {
         graph += &format!("{concat_inputs}concat=n={n}:v=1:a=1{video_out}{audio_out}");
     } else {
         graph += &format!("{concat_inputs}concat=n={n}:v=1:a=0{video_out}");
@@ -240,7 +337,11 @@ pub fn build_filter_graph(plan: &Plan) -> String {
     for (k, o) in plan.overlays.iter().enumerate() {
         let last = k + 1 == plan.overlays.len();
         let label = if last { "outv".to_string() } else { format!("o{k}") };
-        let tail = if last { ",format=yuv420p" } else { "" };
+        let tail = match (last, vfade.is_empty()) {
+            (true, true) => ",format=yuv420p".to_string(),
+            (true, false) => format!(",{vfade},format=yuv420p"),
+            _ => String::new(),
+        };
         graph += &format!(
             ";[{prev}][{idx}:v]overlay=x=(main_w-overlay_w)/2:y=main_h*{y:.4}-overlay_h/2:\
              enable='between(t,{a},{b})'{tail}[{label}]",
@@ -251,19 +352,31 @@ pub fn build_filter_graph(plan: &Plan) -> String {
         );
         prev = label;
     }
+    if plan.overlays.is_empty() && !vfade.is_empty() {
+        graph += &format!(";[cv]{vfade},format=yuv420p[outv]");
+    }
     if audio_post {
-        let total: f64 = plan.segments.iter().map(|s| s.length).sum();
         let fmt = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
         let mut idx = n + plan.overlays.len();
         let mut mix: Vec<String> = Vec::new();
         if let Some(m) = &plan.style.music {
-            // Music is ducked by the speech (sidechain), then mixed under it.
-            graph += &format!(
-                ";[ca]asplit=2[sp][sc];[{idx}:a:0]{fmt},atrim=duration={t},volume={g:.1}dB[mus];\
-                 [mus][sc]sidechaincompress=threshold=0.02:ratio=12:attack=10:release=400[duck]",
-                t = secs(total),
-                g = m.gain_db
-            );
+            if plan.style.music_no_duck {
+                // B-roll: the clips' own sound sits under steady music; nothing ducks the music.
+                graph += &format!(
+                    ";[ca]volume={n:.1}dB[sp];[{idx}:a:0]{fmt},atrim=duration={t},volume={g:.1}dB[duck]",
+                    n = plan.style.natural_gain_db,
+                    t = secs(total),
+                    g = m.gain_db
+                );
+            } else {
+                // Music is ducked by the speech (sidechain), then mixed under it.
+                graph += &format!(
+                    ";[ca]asplit=2[sp][sc];[{idx}:a:0]{fmt},atrim=duration={t},volume={g:.1}dB[mus];\
+                     [mus][sc]sidechaincompress=threshold=0.02:ratio=12:attack=10:release=400[duck]",
+                    t = secs(total),
+                    g = m.gain_db
+                );
+            }
             mix.push("sp".into());
             mix.push("duck".into());
             idx += 1;
@@ -281,7 +394,12 @@ pub fn build_filter_graph(plan: &Plan) -> String {
                 mix.push(format!("d{j}"));
             }
         }
-        let finish = if plan.style.loudnorm { "loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000" } else { "anull" };
+        let base = if plan.style.loudnorm { "loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000" } else { "anull" };
+        let finish = if fade > 0.05 {
+            format!("{base},afade=t=in:st=0:d={f:.2},afade=t=out:st={o:.3}:d={f:.2}", f = fade, o = total - fade)
+        } else {
+            base.to_string()
+        };
         if mix.len() == 1 {
             graph += &format!(";[{}]{finish}[outa]", mix[0]);
         } else {
@@ -293,7 +411,9 @@ pub fn build_filter_graph(plan: &Plan) -> String {
 }
 
 pub fn build_ffmpeg_args(plan: &Plan, output: &Path) -> Vec<OsString> {
-    let mut args: Vec<OsString> = ["-hide_banner", "-nostdin", "-v", "error", "-progress", "pipe:1", "-nostats"]
+    // AIRM_FFMPEG_LOG=warning|info|... gives a more detailed FFmpeg log when debugging a failed render.
+    let level = std::env::var("AIRM_FFMPEG_LOG").unwrap_or_else(|_| "error".into());
+    let mut args: Vec<OsString> = ["-hide_banner", "-nostdin", "-v", level.as_str(), "-progress", "pipe:1", "-nostats"]
         .iter()
         .map(OsString::from)
         .collect();
@@ -302,10 +422,11 @@ pub fn build_ffmpeg_args(plan: &Plan, output: &Path) -> Vec<OsString> {
         args.push(s.path.clone().into_os_string());
     }
     for o in &plan.overlays {
-        args.push("-i".into());
+        // One decoder per caption image: a single thread each, or hundreds of them exhaust macOS's per-process thread limit.
+        args.extend(["-threads", "1", "-i"].map(OsString::from));
         args.push(o.image.clone().into_os_string());
     }
-    let any_audio = plan.segments.iter().any(|s| s.has_audio);
+    let any_audio = has_audio_track(plan);
     if let (true, Some(m)) = (any_audio, &plan.style.music) {
         args.extend(["-stream_loop", "-1", "-i"].map(OsString::from));
         args.push(m.path.clone().into_os_string());
@@ -314,10 +435,15 @@ pub fn build_ffmpeg_args(plan: &Plan, output: &Path) -> Vec<OsString> {
         args.push("-i".into());
         args.push(fx.path.clone().into_os_string());
     }
+    if plan.overlays.len() > MANY_OVERLAYS {
+        // Every overlay filter wants its own worker threads; a long reel (hundreds of captions) would pass
+        // macOS's 4096-threads-per-process limit and FFmpeg dies with "Resource temporarily unavailable".
+        args.extend(["-filter_complex_threads", "1"].map(OsString::from));
+    }
     args.push("-filter_complex".into());
     args.push(build_filter_graph(plan).into());
     args.extend(["-map", "[outv]"].map(OsString::from));
-    if plan.segments.iter().any(|s| s.has_audio) {
+    if any_audio {
         args.extend(["-map", "[outa]", "-c:a", "aac", "-b:a", "160k"].map(OsString::from));
     } else {
         args.push("-an".into());
@@ -352,11 +478,33 @@ pub fn export(req: &ExportRequest, on_progress: impl Fn(f64)) -> Result<ExportRe
     render_to(&plan, &out, req.overwrite_confirmed, on_progress)
 }
 
+/// Above this many caption overlays FFmpeg is told to run its filter graph on one thread.
+const MANY_OVERLAYS: usize = 150;
+
+/// Apps launched from Finder start with a soft limit of 256 open files, but FFmpeg opens one input per caption
+/// image (hundreds for a long reel). Raises the soft limit (child processes inherit it) up to the hard limit,
+/// capped at 10240, which macOS accepts.
+pub fn raise_open_file_limit() {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: plain libc calls on a local struct.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        let want = lim.rlim_max.min(10240);
+        if lim.rlim_cur < want {
+            lim.rlim_cur = want;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+        }
+    }
+}
+
 /// Renders an already-validated plan to an already-validated output path (temp file, inspect, rename).
 pub fn render_to(plan: &Plan, out: &Path, overwrite_confirmed: bool, on_progress: impl Fn(f64)) -> Result<ExportResult, String> {
     let ffmpeg = media::find_tool("ffmpeg").ok_or("FFmpeg not found. Install it (e.g. `brew install ffmpeg`).")?;
+    raise_open_file_limit();
     let temp = temp_path_for(&out);
-    let total: f64 = plan.segments.iter().map(|s| s.length).sum();
+    let total = plan_total(plan);
 
     let mut child = Command::new(ffmpeg)
         .args(build_ffmpeg_args(&plan, &temp))
@@ -504,6 +652,68 @@ mod tests {
     }
 
     #[test]
+    fn travel_graph_crossfades_pans_grades_and_fades() {
+        let mut plan = plan_segments(&[seg("/v/a.mp4", 0.0, 2.0), seg("/v/b.mp4", 0.0, 2.0), seg("/v/a.mp4", 1.0, 3.0)], fake_probe).unwrap();
+        plan.width = 1080;
+        plan.height = 1920;
+        plan.fit = Fit::Crop;
+        plan.style = Style {
+            pan: true,
+            grade: Grade::Warm,
+            transition: Some(Transition { style: TransitionStyle::Smooth, sec: 0.4 }),
+            music: Some(Music { path: "/m/song.mp3".into(), gain_db: -16.0 }),
+            music_no_duck: true,
+            natural_gain_db: -9.0,
+            fade_sec: 0.5,
+            ..Default::default()
+        };
+        let g = build_filter_graph(&plan);
+        assert!(g.contains("x='(iw-ow)/2+(1)*min(70,(iw-ow)/2)*(2*t/2.000-1)'"), "{g}");
+        assert!(g.contains("(-1)*min(70"), "second clip drifts the other way");
+        assert!(g.contains("eq=contrast=1.06:saturation=1.2"));
+        assert!(g.contains("[v0][v1]xfade=transition=fade:duration=0.400:offset=1.600[x1];"));
+        assert!(g.contains("[x1][v2]xfade=transition=fade:duration=0.400:offset=3.200[cv];"), "{g}");
+        assert!(g.contains("[a0][a1]acrossfade=d=0.400"));
+        assert!(g.contains(";[cv]fade=t=in:st=0:d=0.50,fade=t=out:st=4.700:d=0.50,format=yuv420p[outv]"), "{g}");
+        // total = 6 - 2 * 0.4 = 5.2s; music steady (no sidechain), natural sound lowered.
+        assert!(g.contains("[ca]volume=-9.0dB[sp]") && !g.contains("sidechaincompress"));
+        assert!(g.contains("afade=t=out:st=4.700:d=0.50"));
+        assert!((plan_total(&plan) - 5.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn music_alone_gives_silent_clips_an_audio_track() {
+        let mut plan = plan_segments(&[seg("/v/b.mp4", 0.0, 2.0)], fake_probe).unwrap();
+        plan.style.music = Some(Music { path: "/m/song.mp3".into(), gain_db: -16.0 });
+        let g = build_filter_graph(&plan);
+        assert!(g.contains("anullsrc") && g.contains("[outa]"), "{g}");
+    }
+
+    #[test]
+    fn many_overlays_run_the_filter_graph_on_one_thread() {
+        let mut plan = plan_segments(&[seg("/v/a.mp4", 0.0, 2.0), seg("/v/a.mp4", 3.0, 4.0)], fake_probe).unwrap();
+        let has = |p: &Plan| {
+            let args = build_ffmpeg_args(p, Path::new("/o.mp4"));
+            args.windows(2).any(|w| w[0] == "-filter_complex_threads" && w[1] == "1")
+        };
+        assert!(!has(&plan));
+        plan.overlays = (0..=MANY_OVERLAYS).map(|i| Overlay { image: format!("/p/{i}.png").into(), start: 0.0, end: 1.0, y_center_frac: 0.7 }).collect();
+        assert!(has(&plan));
+    }
+
+    #[test]
+    fn raising_the_open_file_limit_never_lowers_it() {
+        fn soft() -> libc::rlim_t {
+            let mut l = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) };
+            l.rlim_cur
+        }
+        let before = soft();
+        raise_open_file_limit();
+        assert!(soft() >= before);
+    }
+
+    #[test]
     fn crop_fit_and_caption_overlays() {
         let mut plan = plan_segments(&[seg("/v/a.mp4", 0.0, 2.0), seg("/v/a.mp4", 3.0, 4.0)], fake_probe).unwrap();
         plan.width = 1080;
@@ -536,6 +746,7 @@ mod tests {
             sfx: Some(Sfx { path: "/fx/whoosh.wav".into(), times: vec![1.9], gain_db: -12.0 }),
             music: Some(Music { path: "/m/song.mp3".into(), gain_db: -18.0 }),
             loudnorm: true,
+            ..Default::default()
         };
         let g = build_filter_graph(&plan);
         // Segment 0 not zoomed, segment 1 punched in to 1.15x then re-cropped.

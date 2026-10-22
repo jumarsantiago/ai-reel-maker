@@ -2,12 +2,13 @@
 //!
 //!   autoedit prepare <video> [--lang auto|tl|en] [--root projects] [--model ID] [--min S] [--max S]
 //!   autoedit render  <project_dir> <plan.json>
+//!   autoedit init | inbox | publish <project_dir> [--final]   (inbox/outbox folder workflow)
 //!   autoedit count   <project_dir>                 (free token count; sends request.json)
 //!   autoedit plan    <project_dir>                 (ONE paid call, budget-gated)
 //!   autoedit autocut <video> [--lang auto]         (free, no AI: rules-based cut + render)
 //!   style flags for render/autocut: --plain --no-zoom --no-sfx --no-highlight --no-loudness --music FILE
 
-use ai_reel_maker_lib::{api, autoedit, plan};
+use ai_reel_maker_lib::{api, autoedit, inbox, plan};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -94,6 +95,26 @@ fn main() -> ExitCode {
             for w in &r.warnings {
                 println!("warning: {w}");
             }
+        }),
+        Some("init") => inbox::base_dir().and_then(|b| inbox::init(&b).map(|c| (b, c))).map(|(b, c)| {
+            println!("folder: {}", b.display());
+            println!("{}", if c.is_empty() { "already set up (nothing overwritten)".to_string() } else { format!("created: {}", c.join(", ")) });
+        }),
+        Some("inbox") => inbox::base_dir().and_then(|b| {
+            let items = inbox::list_inbox(&b.join("inbox"), &b.join("outbox"))?;
+            if items.is_empty() {
+                println!("inbox is empty: {}", b.join("inbox").display());
+            }
+            for i in &items {
+                println!("{}\t{}\t{}", i.status(), i.file, i.path);
+            }
+            Ok(())
+        }),
+        Some("publish") if args.len() >= 3 => inbox::base_dir().and_then(|b| {
+            let dir = std::fs::canonicalize(&args[2]).map_err(|e| format!("{}: {e}", args[2]))?;
+            let out = inbox::publish(&dir, &b.join("outbox"), args.iter().any(|a| a == "--final"))?;
+            println!("published: {}", out.display());
+            Ok(())
         }),
         Some("count") if args.len() >= 3 => read_request(&args[2]).and_then(|req| api::count_tokens(&req)).map(|n| {
             println!("input tokens (count_tokens, free): {n}");

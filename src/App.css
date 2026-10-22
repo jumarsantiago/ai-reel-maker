@@ -106,3 +106,9 @@ dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; 
 .auto-cut-box { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
 .btn.wide { width: 100%; }
 .small-note { font-size: 12px; margin: 8px 0 0; white-space: normal; }
+.style-options { display: grid; gap: 6px; margin-top: 12px; }
+.check { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+.check input { accent-color: var(--accent); }
+.music-row { display: flex; align-items: center; gap: 6px; margin-top: 10px; font-size: 13px; min-width: 0; }
+.music-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.btn.small { padding: 3px 8px; font-size: 12px; }

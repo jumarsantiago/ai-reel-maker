@@ -9,6 +9,8 @@ Usage:
 --fit crop   compare against the source scaled-to-cover and centre-cropped (vertical reels).
 --srt FILE   frame matching then uses only the area above the caption band, and each caption is
              checked to be visible: its band must differ clearly from the uncaptioned source.
+--style FILE style.json from the render: applies each segment's punch-in zoom when matching frames.
+--lufs N     integrated loudness must be within 1 LU of N and true peak at most -1 dBTP.
 
 Checks: file exists and is non-empty; ffprobe finds an H.264 video stream; total duration matches the
 sum of segments; every frame decodes; and for each segment, frames near its start and end match the
@@ -52,9 +54,13 @@ def probe(path):
 CAPTION_BAND = (0.60, 0.80)  # fraction of height; captions are centred at 0.70
 
 
-def psnr(output, t_out, source, t_src, w, h, fit_mode="pad", band=None):
+def psnr(output, t_out, source, t_src, w, h, fit_mode="pad", band=None, zoom=1.0):
     if fit_mode == "crop":
-        fit = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1"
+        fit = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+        if zoom > 1.001:
+            zw, zh = (round(w * zoom) // 2) * 2, (round(h * zoom) // 2) * 2
+            fit += f",scale={zw}:{zh},crop={w}:{h}"
+        fit += ",setsar=1"
     else:
         fit = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1"
     roi = ""
@@ -107,6 +113,8 @@ def main():
     fit_mode = take("--fit") or "pad"
     srt = take("--srt")
     validated = take("--validated")
+    style_file = take("--style")
+    lufs = take("--lufs")
     source = take("--source")
     if not args or (validated is None and len(args) < 2) or fit_mode not in ("pad", "crop"):
         sys.exit(__doc__)
@@ -121,6 +129,8 @@ def main():
         src, a, b = spec.rsplit(":", 2)
         segments.append((src, float(a), float(b)))
     captions = parse_srt(srt) if srt else []
+    zooms = json.load(open(style_file))["zoom_per_segment"] if style_file else []
+    zoom_of = lambda i: zooms[i] if i < len(zooms) else 1.0
     # With captions, frame matching uses only the area above the caption band.
     match_band = (0.0, CAPTION_BAND[0]) if captions else None
 
@@ -151,7 +161,9 @@ def main():
 
     expected = sum(b - a for _, a, b in segments)
     actual = float(info["format"]["duration"])
-    check("duration", abs(actual - expected) <= DURATION_TOL, f"{actual:.3f}s (expected {expected:.3f}s)")
+    # Each segment is rounded up to whole frames (concat pads its audio to match, so A/V stay in sync).
+    tol = DURATION_TOL + len(segments) / fps
+    check("duration", abs(actual - expected) <= tol, f"{actual:.3f}s (expected {expected:.3f}s, tolerance {tol:.2f}s)")
 
     dec = subprocess.run([FFMPEG, "-v", "error", "-nostdin", "-i", output, "-f", "null", "-"],
                          capture_output=True, text=True)
@@ -164,7 +176,7 @@ def main():
     for i, (src, a, b) in enumerate(segments, 1):
         length = b - a
         for label, rel in (("start", offset), ("end", length - offset)):
-            p = psnr(output, start + rel, src, a + rel, w, h, fit_mode, match_band)
+            p = psnr(output, start + rel, src, a + rel, w, h, fit_mode, match_band, zoom_of(i - 1))
             check(f"segment {i} {label}", p is not None and p >= PSNR_MIN,
                   f"out@{start + rel:.3f}s vs {os.path.basename(src)}@{a + rel:.3f}s PSNR "
                   f"{'n/a' if p is None else ('inf' if p == float('inf') else f'{p:.1f} dB')}")
@@ -174,8 +186,8 @@ def main():
     # (text drawn there), while the area above it still matches (same frame, correct timing).
     if captions:
         bounds, t = [], 0.0
-        for src, a, b in segments:
-            bounds.append((t, t + (b - a), src, a))
+        for k, (src, a, b) in enumerate(segments):
+            bounds.append((t, t + (b - a), src, a, zoom_of(k)))
             t += b - a
         for i, (ca, cb, text) in enumerate(captions, 1):
             mid = (ca + cb) / 2
@@ -184,11 +196,21 @@ def main():
                 check(f"caption {i}", False, f"{text!r} at {mid:.2f}s is outside every segment")
                 continue
             src_t = seg[3] + (mid - seg[0])
-            band = psnr(output, mid, seg[2], src_t, w, h, fit_mode, CAPTION_BAND)
-            above = psnr(output, mid, seg[2], src_t, w, h, fit_mode, match_band)
+            band = psnr(output, mid, seg[2], src_t, w, h, fit_mode, CAPTION_BAND, seg[4])
+            above = psnr(output, mid, seg[2], src_t, w, h, fit_mode, match_band, seg[4])
             ok = band is not None and above is not None and above >= PSNR_MIN and band <= above - 8
             check(f"caption {i}", ok, f"{text!r} @{mid:.2f}s band {band if band is None else round(band, 1)} dB "
                   f"vs above {above if above is None else round(above, 1)} dB")
+
+    if lufs is not None:
+        r = subprocess.run([FFMPEG, "-hide_banner", "-nostdin", "-nostats", "-i", output, "-vn", "-af", "ebur128=peak=true",
+                            "-f", "null", "-"], capture_output=True, text=True)
+        i_match = re.findall(r"I:\s+(-?[\d.]+) LUFS", r.stderr)
+        p_match = re.findall(r"Peak:\s+(-?[\d.]+|-inf) dBFS", r.stderr)
+        integrated = float(i_match[-1]) if i_match else None
+        peak = float(p_match[-1]) if p_match and p_match[-1] != "-inf" else None
+        check("loudness", integrated is not None and abs(integrated - float(lufs)) <= 1.0 and peak is not None and peak <= -1.0,
+              f"{integrated} LUFS (target {lufs}), true peak {peak} dBTP")
 
     passed = sum(results)
     print(f"\n{passed}/{len(results)} checks passed")

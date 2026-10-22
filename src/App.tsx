@@ -48,6 +48,16 @@ type AutoCutResult = {
   keptWordsMatch: number;
 };
 
+type EditStyle = {
+  zoom: boolean;
+  soundEffects: boolean;
+  highlightWords: boolean;
+  loudness: boolean;
+  music: string | null;
+};
+
+const MUSIC_EXTENSIONS = ["mp3", "m4a", "aac", "wav", "aif", "aiff", "flac"];
+
 type AutoCutState =
   | { kind: "idle" }
   | { kind: "running"; source: string; stage: string; progress: number }
@@ -84,6 +94,13 @@ function App() {
   const [trimError, setTrimError] = useState<string | null>(null);
   const [exportState, setExportState] = useState<ExportState>({ kind: "idle" });
   const [autoCut, setAutoCut] = useState<AutoCutState>({ kind: "idle" });
+  const [editStyle, setEditStyle] = useState<EditStyle>({
+    zoom: true,
+    soundEffects: true,
+    highlightWords: true,
+    loudness: true,
+    music: null,
+  });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [keyStatus, setKeyStatus] = useState<KeyStatus | null>(null);
   const [keyInput, setKeyInput] = useState("");
@@ -225,7 +242,7 @@ function App() {
       setAutoCut((s) => (s.kind === "running" ? { ...s, progress: e.payload } : s)),
     );
     try {
-      const result = await invoke<AutoCutResult>("auto_cut", { path: m.path });
+      const result = await invoke<AutoCutResult>("auto_cut", { path: m.path, style: editStyle });
       setAutoCut({ kind: "done", result });
     } catch (e) {
       setAutoCut({ kind: "error", message: String(e) });
@@ -233,6 +250,11 @@ function App() {
       offStage();
       offProgress();
     }
+  }
+
+  async function chooseMusic() {
+    const picked = await open({ multiple: false, directory: false, filters: [{ name: "Audio", extensions: MUSIC_EXTENSIONS }] });
+    if (typeof picked === "string") setEditStyle((st) => ({ ...st, music: picked }));
   }
 
   async function addResultToMedia(path: string) {
@@ -424,15 +446,49 @@ function App() {
               className="btn primary wide"
               onClick={() => runAutoCut(selectedMedia)}
               disabled={autoCut.kind === "running" || !selectedMedia.hasAudio}
-              title={selectedMedia.hasAudio ? "Cut pauses, fillers and repeats automatically" : "Needs a video with speech"}
+              title={selectedMedia.hasAudio ? "Cut, zoom, add sounds and captions automatically" : "Needs a video with speech"}
             >
-              ✨ Auto-cut (free, no AI)
+              ✨ Auto Edit (free, no AI)
             </button>
-            <p className="muted small-note">
-              {selectedMedia.hasAudio
-                ? "Removes long pauses, um/uh and repeated phrases, then makes a 9:16 reel with captions. Runs on this Mac."
-                : "This video has no audio, so there is nothing to transcribe."}
-            </p>
+            {selectedMedia.hasAudio ? (
+              <>
+                <div className="style-options">
+                  {([
+                    ["zoom", "Zoom on cuts"],
+                    ["soundEffects", "Whoosh on cuts"],
+                    ["highlightWords", "Highlight spoken word"],
+                    ["loudness", "Even out volume"],
+                  ] as const).map(([key, label]) => (
+                    <label key={key} className="check">
+                      <input
+                        type="checkbox"
+                        checked={editStyle[key]}
+                        onChange={(e) => setEditStyle((st) => ({ ...st, [key]: e.target.checked }))}
+                      />
+                      {label}
+                    </label>
+                  ))}
+                </div>
+                <div className="music-row">
+                  <span className="muted">Music:</span>
+                  <span className="music-name" title={editStyle.music ?? ""}>
+                    {editStyle.music ? editStyle.music.split("/").pop() : "none"}
+                  </span>
+                  <button className="btn small" onClick={chooseMusic}>Choose…</button>
+                  {editStyle.music && (
+                    <button className="btn small" onClick={() => setEditStyle((st) => ({ ...st, music: null }))} aria-label="Remove music">
+                      ✕
+                    </button>
+                  )}
+                </div>
+                <p className="muted small-note">
+                  Cuts pauses, um/uh and repeats, then makes a 9:16 reel with captions. Runs on this Mac. Use music you
+                  have the rights to.
+                </p>
+              </>
+            ) : (
+              <p className="muted small-note">This video has no audio, so there is nothing to transcribe.</p>
+            )}
           </div>
           </>
         ) : (
@@ -475,7 +531,7 @@ function App() {
       {autoCut.kind !== "idle" && (
         <div className="modal-backdrop">
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="autocut-title">
-            <h2 id="autocut-title">Auto-cut</h2>
+            <h2 id="autocut-title">Auto Edit</h2>
             {autoCut.kind === "running" && (
               <>
                 <p>{autoCut.source}</p>

@@ -5,6 +5,7 @@
 //!   autoedit count   <project_dir>                 (free token count; sends request.json)
 //!   autoedit plan    <project_dir>                 (ONE paid call, budget-gated)
 //!   autoedit autocut <video> [--lang auto]         (free, no AI: rules-based cut + render)
+//!   style flags for render/autocut: --plain --no-zoom --no-sfx --no-highlight --no-loudness --music FILE
 
 use ai_reel_maker_lib::{api, autoedit, plan};
 use std::path::Path;
@@ -12,6 +13,18 @@ use std::process::ExitCode;
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
+}
+
+/// Reel style flags: default is the full Auto Edit look; --plain turns everything off.
+fn style_from(args: &[String]) -> autoedit::EditStyle {
+    let mut st = if args.iter().any(|a| a == "--plain") { autoedit::EditStyle::plain() } else { autoedit::EditStyle::default() };
+    let has = |f: &str| args.iter().any(|a| a == f);
+    if has("--no-zoom") { st.zoom = false; }
+    if has("--no-sfx") { st.sound_effects = false; }
+    if has("--no-highlight") { st.highlight_words = false; }
+    if has("--no-loudness") { st.loudness = false; }
+    st.music = opt(args, "--music").and_then(|m| std::fs::canonicalize(m).ok()).map(|p| p.to_string_lossy().into_owned());
+    st
 }
 
 const LEDGER: &str = "projects/api_ledger.json";
@@ -69,7 +82,7 @@ fn main() -> ExitCode {
                 println!("request.json written for review - nothing was sent.");
             })
         }
-        Some("render") if args.len() >= 4 => autoedit::render_plan(Path::new(&args[2]), Path::new(&args[3]), |f| {
+        Some("render") if args.len() >= 4 => autoedit::render_plan(Path::new(&args[2]), Path::new(&args[3]), &style_from(&args), |f| {
             eprint!("\rrendering {:>3.0}%", f * 100.0);
         })
         .map(|r| {
@@ -98,7 +111,7 @@ fn main() -> ExitCode {
                 .and_then(|v| {
                     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
                     let r = std::fs::canonicalize(&root).map_err(|e| e.to_string())?;
-                    autoedit::auto_cut(&v.to_string_lossy(), &r, &lang, |s| eprintln!("{s}"), |f| eprint!("\rrendering {:>3.0}%", f * 100.0))
+                    autoedit::auto_cut(&v.to_string_lossy(), &r, &lang, &style_from(&args), |s| eprintln!("{s}"), |f| eprint!("\rrendering {:>3.0}%", f * 100.0))
                 })
                 .map(|(dir, r)| {
                     eprintln!();

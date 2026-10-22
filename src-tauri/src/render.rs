@@ -58,6 +58,33 @@ pub struct Plan {
     pub fps: u32,
     pub fit: Fit,
     pub overlays: Vec<Overlay>,
+    pub style: Style,
+}
+
+/// Optional "reel" styling; all off by default so plain exports are unchanged.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Style {
+    /// Per-segment punch-in zoom (1.0 = none). Missing entries mean 1.0. Crop fit only.
+    pub zoom: Vec<f64>,
+    /// A short sound effect mixed in at each listed output time.
+    pub sfx: Option<Sfx>,
+    /// Background music, looped to length and ducked under speech.
+    pub music: Option<Music>,
+    /// Normalize the final mix to -14 LUFS (social-media loudness).
+    pub loudnorm: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sfx {
+    pub path: PathBuf,
+    pub times: Vec<f64>,
+    pub gain_db: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Music {
+    pub path: PathBuf,
+    pub gain_db: f64,
 }
 
 /// How each clip fills the output frame.
@@ -126,6 +153,7 @@ pub fn plan_segments(
         fps: if (1..=120).contains(&fps) { fps } else { 30 },
         fit: Fit::Pad,
         overlays: Vec::new(),
+        style: Style::default(),
     })
 }
 
@@ -173,7 +201,13 @@ pub fn build_filter_graph(plan: &Plan) -> String {
             Fit::Pad => format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"),
             Fit::Crop => format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"),
         };
-        graph += &format!("[{i}:v:0]setpts=PTS-STARTPTS,{frame},setsar=1,fps={fps},format=yuv420p[v{i}];");
+        let z = plan.style.zoom.get(i).copied().unwrap_or(1.0);
+        let zoom = if plan.fit == Fit::Crop && z > 1.001 {
+            format!(",scale={}:{},crop={w}:{h}", even((w as f64 * z).round() as u32), even((h as f64 * z).round() as u32))
+        } else {
+            String::new()
+        };
+        graph += &format!("[{i}:v:0]setpts=PTS-STARTPTS,{frame}{zoom},setsar=1,fps={fps},format=yuv420p[v{i}];");
         concat_inputs += &format!("[v{i}]");
         if any_audio {
             let len = secs(s.length);
@@ -193,8 +227,11 @@ pub fn build_filter_graph(plan: &Plan) -> String {
     }
     let n = plan.segments.len();
     let video_out = if plan.overlays.is_empty() { "[outv]" } else { "[cv]" };
+    let sfx_times = plan.style.sfx.as_ref().map(|x| x.times.as_slice()).unwrap_or(&[]);
+    let audio_post = any_audio && (plan.style.music.is_some() || !sfx_times.is_empty() || plan.style.loudnorm);
+    let audio_out = if audio_post { "[ca]" } else { "[outa]" };
     if any_audio {
-        graph += &format!("{concat_inputs}concat=n={n}:v=1:a=1{video_out}[outa]");
+        graph += &format!("{concat_inputs}concat=n={n}:v=1:a=1{video_out}{audio_out}");
     } else {
         graph += &format!("{concat_inputs}concat=n={n}:v=1:a=0{video_out}");
     }
@@ -214,6 +251,44 @@ pub fn build_filter_graph(plan: &Plan) -> String {
         );
         prev = label;
     }
+    if audio_post {
+        let total: f64 = plan.segments.iter().map(|s| s.length).sum();
+        let fmt = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
+        let mut idx = n + plan.overlays.len();
+        let mut mix: Vec<String> = Vec::new();
+        if let Some(m) = &plan.style.music {
+            // Music is ducked by the speech (sidechain), then mixed under it.
+            graph += &format!(
+                ";[ca]asplit=2[sp][sc];[{idx}:a:0]{fmt},atrim=duration={t},volume={g:.1}dB[mus];\
+                 [mus][sc]sidechaincompress=threshold=0.02:ratio=12:attack=10:release=400[duck]",
+                t = secs(total),
+                g = m.gain_db
+            );
+            mix.push("sp".into());
+            mix.push("duck".into());
+            idx += 1;
+        } else {
+            mix.push("ca".into());
+        }
+        if let Some(fx) = plan.style.sfx.as_ref().filter(|x| !x.times.is_empty()) {
+            let k = fx.times.len();
+            let labels: String = (0..k).map(|j| format!("[s{j}]")).collect();
+            let split = if k == 1 { "anull".to_string() } else { format!("asplit={k}") };
+            graph += &format!(";[{idx}:a:0]{fmt},volume={g:.1}dB,{split}{labels}", g = fx.gain_db);
+            for (j, t) in fx.times.iter().enumerate() {
+                let ms = (t.max(0.0) * 1000.0).round() as u64;
+                graph += &format!(";[s{j}]adelay=delays={ms}:all=1[d{j}]");
+                mix.push(format!("d{j}"));
+            }
+        }
+        let finish = if plan.style.loudnorm { "loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000" } else { "anull" };
+        if mix.len() == 1 {
+            graph += &format!(";[{}]{finish}[outa]", mix[0]);
+        } else {
+            let inputs: String = mix.iter().map(|m| format!("[{m}]")).collect();
+            graph += &format!(";{inputs}amix=inputs={}:duration=first:normalize=0,{finish}[outa]", mix.len());
+        }
+    }
     graph
 }
 
@@ -229,6 +304,15 @@ pub fn build_ffmpeg_args(plan: &Plan, output: &Path) -> Vec<OsString> {
     for o in &plan.overlays {
         args.push("-i".into());
         args.push(o.image.clone().into_os_string());
+    }
+    let any_audio = plan.segments.iter().any(|s| s.has_audio);
+    if let (true, Some(m)) = (any_audio, &plan.style.music) {
+        args.extend(["-stream_loop", "-1", "-i"].map(OsString::from));
+        args.push(m.path.clone().into_os_string());
+    }
+    if let (true, Some(fx)) = (any_audio, plan.style.sfx.as_ref().filter(|x| !x.times.is_empty())) {
+        args.push("-i".into());
+        args.push(fx.path.clone().into_os_string());
     }
     args.push("-filter_complex".into());
     args.push(build_filter_graph(plan).into());
@@ -438,6 +522,45 @@ mod tests {
         let args: Vec<String> = build_ffmpeg_args(&plan, Path::new("/o.mp4")).into_iter().map(|a| a.to_string_lossy().into_owned()).collect();
         let inputs: Vec<&String> = args.windows(2).filter(|w| w[0] == "-i").map(|w| &w[1]).collect();
         assert_eq!(inputs, ["/v/a.mp4", "/v/a.mp4", "/p/000.png", "/p/001.png"]);
+    }
+
+    #[test]
+    fn reel_style_zoom_sfx_music_loudness() {
+        let mut plan = plan_segments(&[seg("/v/a.mp4", 0.0, 2.0), seg("/v/a.mp4", 3.0, 4.0)], fake_probe).unwrap();
+        plan.width = 1080;
+        plan.height = 1920;
+        plan.fit = Fit::Crop;
+        plan.overlays = vec![Overlay { image: "/p/0.png".into(), start: 0.0, end: 1.0, y_center_frac: 0.7 }];
+        plan.style = Style {
+            zoom: vec![1.0, 1.15],
+            sfx: Some(Sfx { path: "/fx/whoosh.wav".into(), times: vec![1.9], gain_db: -12.0 }),
+            music: Some(Music { path: "/m/song.mp3".into(), gain_db: -18.0 }),
+            loudnorm: true,
+        };
+        let g = build_filter_graph(&plan);
+        // Segment 0 not zoomed, segment 1 punched in to 1.15x then re-cropped.
+        assert!(g.contains("[0:v:0]setpts=PTS-STARTPTS,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1"));
+        assert!(g.contains("crop=1080:1920,scale=1242:2208,crop=1080:1920,setsar=1"));
+        assert!(g.contains("concat=n=2:v=1:a=1[cv][ca]"));
+        // Inputs: 2 segments, 1 overlay (idx 2), music (idx 3), sfx (idx 4).
+        assert!(g.contains("[3:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration=3.000,volume=-18.0dB[mus]"));
+        assert!(g.contains("[mus][sc]sidechaincompress"));
+        assert!(g.contains("[4:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=-12.0dB,anull[s0]"));
+        assert!(g.contains("[s0]adelay=delays=1900:all=1[d0]"));
+        assert!(g.ends_with("[sp][duck][d0]amix=inputs=3:duration=first:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[outa]"));
+        let args: Vec<String> = build_ffmpeg_args(&plan, Path::new("/o.mp4")).into_iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let inputs: Vec<&String> = args.windows(2).filter(|w| w[0] == "-i").map(|w| &w[1]).collect();
+        assert_eq!(inputs, ["/v/a.mp4", "/v/a.mp4", "/p/0.png", "/m/song.mp3", "/fx/whoosh.wav"]);
+        assert!(args.windows(3).any(|w| w[0] == "-stream_loop" && w[1] == "-1" && w[2] == "-i"));
+    }
+
+    #[test]
+    fn loudnorm_only_and_default_untouched() {
+        let mut plan = plan_segments(&[seg("/v/a.mp4", 0.0, 2.0)], fake_probe).unwrap();
+        let plain = build_filter_graph(&plan);
+        assert!(plain.ends_with("concat=n=1:v=1:a=1[outv][outa]"));
+        plan.style.loudnorm = true;
+        assert!(build_filter_graph(&plan).ends_with("concat=n=1:v=1:a=1[outv][ca];[ca]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[outa]"));
     }
 
     #[test]

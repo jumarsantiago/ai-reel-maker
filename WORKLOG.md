@@ -28,6 +28,34 @@ Gate: MET - safe path + feasible toolchain.
 ## M1 - Desktop shell + real media import (DONE 2026-10-22)
 Gate MET: owner opened the debug .app, imported test-media/clip-a.mp4 by hand, confirmed preview playback
   and properties (1280x720, h264, 30 fps, audio) - owner-reported, not automated.
+## M9 - Auto Edit style: zoom, whoosh, word-highlight captions, music ducking, loudness (DONE 2026-10-22)
+Owner asked for automatic zoom/sounds/captions "etc." in-app; no answers to music/caption questions, so
+defaults: white bold captions + yellow spoken-word highlight, no default music (picker), all effects on.
+- render.rs Style: per-segment zoom (scale+crop, Crop fit), SFX (asplit+adelay per cut), music
+  (-stream_loop -1, sidechaincompress ducked by speech), amix normalize=0, loudnorm I=-14 TP=-1.5.
+  Default Style = off, so plain Export unchanged (test asserts the old graph).
+- captions.rs: render_words_png (per-word yellow highlight), CaptionStyle::reels (96 px).
+- autoedit.rs: EditStyle {zoom, soundEffects, highlightWords, loudness, music}; zoom 1.0/1.15 alternating;
+  whoosh generated locally (filtered pink noise, ~/Library/Application Support/ai-reel-maker/sfx);
+  caption_word_times (transcript timings if counts match, else by word length); style.json per render.
+- autoplan: captions 1-3 words / 20 chars; short (<0.35s) captions merged - FOUND by validator rejecting
+  a 0.11s "ice." caption on first styled run.
+- UI: "Auto Edit (free, no AI)" + 4 checkboxes + music Choose/remove; plural fix ("1 filler").
+- verify_export.py: --style (zoom-aware PSNR), --lufs; duration tolerance = 0.15s + 1 frame/segment
+  (each segment rounds up to whole frames; concat pads audio, A/V stay in sync: last word 17.68s / 17.77s).
+- test-media/test-music.m4a: synthetic 12s tone bed at -14 LUFS (first attempt was ~-30 dB -> music
+  inaudible -> ducking measurement inconclusive; rebuilt and re-measured).
+Results (actual):
+- cargo test --lib 43/43; npm test 8/8; build OK.
+- CLI autocut (default style): 17.80s, 22 captions (51 highlight PNGs), zoom [1,1.15]x4, 7 whooshes.
+  Loudness -14.2 LUFS / -2.4 dBTP. SFX proof: diff vs --no-sfx render RMS ~200 in all 7 whoosh windows vs
+  36.7 elsewhere. Music proof: music component RMS 139 vs codec noise ~37; 5.1 dB quieter under speech.
+- verify (zoom-aware) 43/43 PASS; negative control without --style fails zoomed segments (20.2 dB).
+- In-app (computer use): import clip-speech, Music = test-music.m4a, all options on -> "Reel ready 0:17.80,
+  5 pauses, 1 filler, 2 repeats, 22 captions, 92%" -> Add to media. ~/Movies/AI Reel Maker/1792675508-clip-speech
+  verify 43/43 PASS, -14.2 LUFS. Source checksums 5/5 OK.
+Limits: zoom is centre-cropped (no face tracking); ducking ~5 dB; one SFX type; synthetic test media only.
+
 ## M8a - Free "Auto-cut" button, rules only, no AI (DONE 2026-10-22)
 Owner chose to build the free automatic path first (Claude Pro does not include API credit).
 - src-tauri/src/autoplan.rs: rules-based EditPlan from the transcript: pauses > 0.4s, fillers

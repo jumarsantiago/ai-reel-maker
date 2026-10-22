@@ -66,7 +66,8 @@ struct AutoCutResult {
 
 /// Free, offline Auto-cut (rules, no AI). Emits `autocut-stage` (text) and `autocut-progress` (0-1).
 #[tauri::command]
-async fn auto_cut(app: tauri::AppHandle, path: String) -> Result<AutoCutResult, String> {
+async fn auto_cut(app: tauri::AppHandle, path: String, style: Option<autoedit::EditStyle>) -> Result<AutoCutResult, String> {
+    let look = style.unwrap_or_default();
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from).ok_or("HOME is not set")?;
     let root = home.join("Movies").join("AI Reel Maker");
     std::fs::create_dir_all(&root).map_err(|e| format!("Cannot create {}: {e}", root.display()))?;
@@ -78,6 +79,7 @@ async fn auto_cut(app: tauri::AppHandle, path: String) -> Result<AutoCutResult, 
             &path,
             &root,
             "auto",
+            &look,
             |s| {
                 let _ = emitter.emit("autocut-stage", s.to_string());
             },

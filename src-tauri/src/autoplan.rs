@@ -16,8 +16,8 @@ const PAD_SEC: f64 = 0.08;
 const MAX_PHRASE: usize = 4;
 /// How many words may sit between a phrase and its restart for it to count as a false start.
 const RESTART_WINDOW: usize = 3;
-const CAPTION_MAX_WORDS: usize = 4;
-const CAPTION_MAX_CHARS: usize = 26;
+const CAPTION_MAX_WORDS: usize = 3;
+const CAPTION_MAX_CHARS: usize = 20;
 pub const FILLERS: &[&str] = &["um", "uh", "uhm", "umm", "ah", "er", "erm", "hmm", "mm"];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -199,6 +199,8 @@ pub fn auto_plan(t: &Transcript) -> EditPlan {
         }
     }
 
+    let captions = merge_short_captions(captions);
+
     let kept: f64 = bounds.iter().map(|(a, b)| b - a).sum();
     EditPlan {
         summary: PlanSummary {
@@ -213,6 +215,37 @@ pub fn auto_plan(t: &Transcript) -> EditPlan {
         removals,
         captions,
     }
+}
+
+/// Captions shorter than this flash by too fast to read; they join a neighbour in the same segment.
+const MIN_CAPTION_READ_SEC: f64 = 0.35;
+
+fn merge_short_captions(caps: Vec<PlanCaption>) -> Vec<PlanCaption> {
+    let mut out: Vec<PlanCaption> = Vec::new();
+    let mut pending: Option<PlanCaption> = None; // a short first caption waiting to join the next one
+    for mut c in caps {
+        if let Some(p) = pending.take() {
+            if p.segment_index == c.segment_index {
+                c.text = format!("{} {}", p.text, c.text);
+                c.start = p.start;
+            } else {
+                out.push(p);
+            }
+        }
+        if c.end - c.start >= MIN_CAPTION_READ_SEC {
+            out.push(c);
+            continue;
+        }
+        match out.last_mut() {
+            Some(prev) if prev.segment_index == c.segment_index => {
+                prev.text = format!("{} {}", prev.text, c.text);
+                prev.end = c.end;
+            }
+            _ => pending = Some(c),
+        }
+    }
+    out.extend(pending);
+    out
 }
 
 fn round2(x: f64) -> f64 {
@@ -288,11 +321,25 @@ mod tests {
     }
 
     #[test]
+    fn short_captions_merge_into_neighbours() {
+        let c = |seg: i64, start: f64, end: f64, text: &str| PlanCaption { segment_index: seg, start, end, text: text.into() };
+        let merged = merge_short_captions(vec![
+            c(0, 0.0, 1.0, "and lots of"), c(0, 1.0, 1.1, "ice."),   // short tail joins previous
+            c(1, 2.0, 2.1, "Oh"), c(1, 2.1, 3.0, "hello there"),       // short head joins next
+            c(2, 4.0, 4.2, "Hi"),                                      // alone in its segment: kept
+        ]);
+        let texts: Vec<&str> = merged.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(texts, ["and lots of ice.", "Oh hello there", "Hi"]);
+        assert_eq!((merged[0].start, merged[0].end), (0.0, 1.1));
+        assert_eq!((merged[1].start, merged[1].end), (2.0, 3.0));
+    }
+
+    #[test]
     fn captions_are_short_and_inside_segments() {
         let t = transcript(&[("Pour", 0.0), ("the", 0.0), ("milk,", 0.0), ("add", 0.0), ("the", 0.0), ("syrup,", 0.0), ("and", 0.0), ("stir", 0.0), ("it", 0.0), ("very", 0.0), ("slowly.", 0.0)]);
         let p = auto_plan(&t);
         let texts: Vec<&str> = p.captions.iter().map(|c| c.text.as_str()).collect();
-        assert_eq!(texts, ["Pour the milk,", "add the syrup,", "and stir it very", "slowly."]);
+        assert_eq!(texts, ["Pour the milk,", "add the syrup,", "and stir it", "very slowly."]);
         let v = validate(&p, &t).unwrap();
         assert_eq!(v.captions.len(), 4);
     }

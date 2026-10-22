@@ -15,7 +15,20 @@ pub struct CaptionStyle {
     pub padding: u32,
 }
 
+pub const HIGHLIGHT_RGB: [u8; 3] = [255, 212, 0];
+
 impl CaptionStyle {
+    /// Bigger, bolder "Reels" captions (1-3 words) for a vertical frame.
+    pub fn reels(frame_width: u32) -> Self {
+        let s = frame_width as f32 / 1080.0;
+        Self {
+            font_px: 96.0 * s,
+            max_width: (frame_width as f32 * 0.88) as u32,
+            outline_px: (9.0 * s).round().max(2.0) as u32,
+            padding: (12.0 * s) as u32,
+        }
+    }
+
     /// Sized for a 1080-wide vertical frame.
     pub fn for_width(frame_width: u32) -> Self {
         let s = frame_width as f32 / 1080.0;
@@ -89,6 +102,11 @@ fn dilate(mask: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
 
 /// Renders one caption to an RGBA PNG; returns its pixel size.
 pub fn render_png(font: &FontVec, style: &CaptionStyle, text: &str, out: &Path) -> Result<(u32, u32), String> {
+    render_words_png(font, style, text, None, out)
+}
+
+/// Renders a caption with word `highlight` (0-based, by whitespace-separated word) in yellow.
+pub fn render_words_png(font: &FontVec, style: &CaptionStyle, text: &str, highlight: Option<usize>, out: &Path) -> Result<(u32, u32), String> {
     let scale = PxScale::from(style.font_px);
     let sf = font.as_scaled(scale);
     let inner = style.max_width.saturating_sub(2 * (style.padding + style.outline_px)) as f32;
@@ -102,13 +120,26 @@ pub fn render_png(font: &FontVec, style: &CaptionStyle, text: &str, out: &Path) 
     let w = (widest + 2.0 * margin).ceil().max(1.0) as usize;
     let h = (line_h * lines.len() as f32 + 2.0 * margin).ceil() as usize;
 
-    let mut mask = vec![0.0f32; w * h];
+    // Two coverage masks: normal (white) glyphs and highlighted (yellow) glyphs.
+    let mut white = vec![0.0f32; w * h];
+    let mut yellow = vec![0.0f32; w * h];
+    let mut word_index = 0usize;
     for (i, line) in lines.iter().enumerate() {
         let lw = text_width(font, scale, line);
         let mut x = (w as f32 - lw) / 2.0;
         let baseline = margin + sf.ascent() + line_h * i as f32;
         let mut prev = None;
+        let mut in_word = false;
         for c in line.chars() {
+            if c.is_whitespace() {
+                if in_word {
+                    word_index += 1;
+                }
+                in_word = false;
+            } else {
+                in_word = true;
+            }
+            let target = if highlight == Some(word_index) && in_word { &mut yellow } else { &mut white };
             let id = sf.glyph_id(c);
             if let Some(p) = prev {
                 x += sf.kern(p, id);
@@ -120,7 +151,7 @@ pub fn render_png(font: &FontVec, style: &CaptionStyle, text: &str, out: &Path) 
                     let px = b.min.x as i32 + gx as i32;
                     let py = b.min.y as i32 + gy as i32;
                     if px >= 0 && py >= 0 && (px as usize) < w && (py as usize) < h {
-                        let m = &mut mask[py as usize * w + px as usize];
+                        let m = &mut target[py as usize * w + px as usize];
                         *m = m.max(cov);
                     }
                 });
@@ -128,14 +159,23 @@ pub fn render_png(font: &FontVec, style: &CaptionStyle, text: &str, out: &Path) 
             x += sf.h_advance(id);
             prev = Some(id);
         }
+        if in_word {
+            word_index += 1;
+        }
     }
+    let mask: Vec<f32> = white.iter().zip(&yellow).map(|(a, b)| a.max(*b)).collect();
     let outline = dilate(&mask, w, h, style.outline_px as usize);
     let mut img = image::RgbaImage::new(w as u32, h as u32);
     for (i, px) in img.pixels_mut().enumerate() {
         let a = outline[i].max(mask[i]);
-        // Straight alpha: white where the glyph is, black outline around it.
-        let white = if a > 0.0 { (mask[i] / a * 255.0).round() as u8 } else { 0 };
-        *px = image::Rgba([white, white, white, (a * 255.0).round() as u8]);
+        if a <= 0.0 {
+            *px = image::Rgba([0, 0, 0, 0]);
+            continue;
+        }
+        // Straight alpha: glyph colour where the glyph is, black outline around it.
+        let (wf, yf) = (white[i] / a, yellow[i] / a);
+        let ch = |k: usize| ((255.0 * wf + HIGHLIGHT_RGB[k] as f32 * yf).min(255.0)).round() as u8;
+        *px = image::Rgba([ch(0), ch(1), ch(2), (a * 255.0).round() as u8]);
     }
     img.save(out).map_err(|e| format!("Cannot write caption image: {e}"))?;
     Ok((w as u32, h as u32))
@@ -189,6 +229,17 @@ mod tests {
         assert!(alphas.iter().any(|&a| a == 255), "has opaque text/outline");
         assert!(alphas.iter().any(|&a| a == 0), "has transparent background");
         assert!(img.pixels().any(|p| p[0] == 255 && p[3] == 255), "has white fill");
+
+        // Highlighting word 1 ("dali") adds yellow pixels; no highlight has none.
+        let q = dir.join("h.png");
+        render_words_png(&font, &CaptionStyle::reels(1080), "Sobrang dali", Some(1), &q).unwrap();
+        let img = image::open(&q).unwrap().to_rgba8();
+        let yellowish = |p: &image::Rgba<u8>| p[3] == 255 && p[0] > 240 && p[1] > 190 && p[2] < 40;
+        assert!(img.pixels().any(yellowish), "highlighted word is yellow");
+        let left_half_yellow = img.enumerate_pixels().filter(|(x, _, p)| *x < img.width() / 3 && yellowish(p)).count();
+        assert_eq!(left_half_yellow, 0, "first word stays white");
+        render_words_png(&font, &CaptionStyle::reels(1080), "Sobrang dali", None, &q).unwrap();
+        assert!(!image::open(&q).unwrap().to_rgba8().pixels().any(yellowish));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -122,14 +122,135 @@ pub struct RenderReport {
     pub filler_words_in_output: Vec<String>,
 }
 
-/// Local step 2: validate a plan (from Claude or a fixture) and render the vertical MP4.
-pub fn render_plan(dir: &Path, plan_path: &Path, on_progress: impl Fn(f64)) -> Result<RenderReport, String> {
+/// Reel styling choices for a render. `Default` = the "Auto Edit" look (everything on, no music).
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditStyle {
+    /// Alternate 100% / 115% punch-in on each cut.
+    pub zoom: bool,
+    /// Soft whoosh at each cut.
+    pub sound_effects: bool,
+    /// Highlight the word being spoken in yellow.
+    pub highlight_words: bool,
+    /// Normalize to -14 LUFS.
+    pub loudness: bool,
+    /// Optional background music file (looped, ducked under speech).
+    pub music: Option<String>,
+}
+
+impl Default for EditStyle {
+    fn default() -> Self {
+        Self { zoom: true, sound_effects: true, highlight_words: true, loudness: true, music: None }
+    }
+}
+
+impl EditStyle {
+    pub fn plain() -> Self {
+        Self { zoom: false, sound_effects: false, highlight_words: false, loudness: false, music: None }
+    }
+}
+
+pub const PUNCH_IN: f64 = 1.15;
+const SFX_GAIN_DB: f64 = -14.0;
+const SFX_LEAD_SEC: f64 = 0.15;
+const MUSIC_GAIN_DB: f64 = -16.0;
+pub const MUSIC_EXTENSIONS: &[&str] = &["mp3", "m4a", "aac", "wav", "aif", "aiff", "flac"];
+
+/// Self-made whoosh (filtered pink noise), generated once locally - no third-party audio.
+pub fn whoosh_path() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or("HOME is not set")?;
+    let dir = home.join("Library/Application Support/ai-reel-maker/sfx");
+    let path = dir.join("whoosh.wav");
+    if path.is_file() {
+        return Ok(path);
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
+    let ffmpeg = media::find_tool("ffmpeg").ok_or("FFmpeg not found.")?;
+    let tmp = dir.join(".whoosh.partial.wav");
+    let ok = std::process::Command::new(ffmpeg)
+        .args(["-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "anoisesrc=d=0.45:c=pink:a=0.6:r=48000"])
+        .args(["-af", "highpass=f=350,lowpass=f=4500,afade=t=in:d=0.18:curve=qsin,afade=t=out:st=0.18:d=0.27:curve=qsin"])
+        .args(["-ac", "2", "-ar", "48000"])
+        .arg(&tmp)
+        .status()
+        .map_err(|e| format!("Cannot run FFmpeg: {e}"))?
+        .success();
+    if !ok {
+        return Err("Could not generate the whoosh sound.".into());
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+/// Accepts an audio file for music: allowed extension, exists, and FFprobe finds an audio stream.
+pub fn check_music(path: &str) -> Result<PathBuf, String> {
+    let p = PathBuf::from(path);
+    let ext = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+    if !p.is_absolute() || !MUSIC_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(format!("Music must be an absolute path to one of: {}.", MUSIC_EXTENSIONS.join(", ")));
+    }
+    if !p.is_file() {
+        return Err(format!("Music file not found: {path}"));
+    }
+    let ffprobe = media::find_tool("ffprobe").ok_or("FFprobe not found.")?;
+    let out = std::process::Command::new(ffprobe)
+        .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "csv=p=0"])
+        .arg(&p)
+        .output()
+        .map_err(|e| format!("Cannot run FFprobe: {e}"))?;
+    if !String::from_utf8_lossy(&out.stdout).contains("audio") {
+        return Err("That music file has no audio stream.".into());
+    }
+    Ok(p)
+}
+
+/// Splits a caption's time range across its words: transcript timings when the word counts
+/// line up, otherwise proportional to word length. Returns contiguous (start, end) per word.
+pub fn caption_word_times(c: &plan::ValidCaption, v: &ValidatedPlan, t: &Transcript) -> Vec<(f64, f64)> {
+    let tokens: Vec<&str> = c.text.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let seg = v.segments.iter().find(|s| c.out_start >= s.out_start - 1e-6 && c.out_start < s.out_end);
+    let mut starts: Vec<f64> = Vec::new();
+    if let Some(seg) = seg {
+        let to_out = |src: f64| seg.out_start + (src - seg.start);
+        let (a, b) = (seg.start + (c.out_start - seg.out_start), seg.start + (c.out_end - seg.out_start));
+        let spoken: Vec<_> = t.words.iter().filter(|w| w.end > a + 0.02 && w.start < b - 0.02).collect();
+        if spoken.len() == tokens.len() {
+            starts = spoken.iter().map(|w| to_out(w.start).clamp(c.out_start, c.out_end)).collect();
+            starts[0] = c.out_start;
+        }
+    }
+    if starts.is_empty() {
+        let total: usize = tokens.iter().map(|x| x.chars().count().max(1)).sum();
+        let mut acc = 0usize;
+        for tok in &tokens {
+            starts.push(c.out_start + (c.out_end - c.out_start) * acc as f64 / total as f64);
+            acc += tok.chars().count().max(1);
+        }
+    }
+    (0..tokens.len())
+        .map(|k| (starts[k], if k + 1 < tokens.len() { starts[k + 1].max(starts[k]) } else { c.out_end }))
+        .collect()
+}
+
+#[derive(Serialize)]
+struct StyleRecord<'a> {
+    style: &'a EditStyle,
+    zoom_per_segment: Vec<f64>,
+    sfx_times: Vec<f64>,
+}
+
+/// Local step 2: validate a plan (from Claude, a fixture or Auto-cut) and render the vertical MP4.
+pub fn render_plan(dir: &Path, plan_path: &Path, look: &EditStyle, on_progress: impl Fn(f64)) -> Result<RenderReport, String> {
     let dir = &std::fs::canonicalize(dir).map_err(|e| format!("Project folder {}: {e}", dir.display()))?;
     let info: MediaInfo = read_json(&dir.join("source.json"))?;
     let t: Transcript = read_json(&dir.join("transcript.json"))?;
     let settings: ProjectSettings = read_json(&dir.join("settings.json"))?;
     let edit: EditPlan = read_json(plan_path)?;
-    log(dir, &format!("render: plan {}", plan_path.display()));
+    log(dir, &format!("render: plan {} style {:?}", plan_path.display(), look));
+    let music = look.music.as_deref().map(check_music).transpose()?;
 
     let v: ValidatedPlan = match plan::validate(&edit, &t) {
         Ok(v) => v,
@@ -142,19 +263,46 @@ pub fn render_plan(dir: &Path, plan_path: &Path, on_progress: impl Fn(f64)) -> R
     write_json(&dir.join("plan.validated.json"), &v)?;
     log(dir, &format!("plan valid: {} segments, {} captions, {:.2}s", v.segments.len(), v.captions.len(), v.total_sec));
 
-    // Captions -> PNGs + SRT.
+    // Captions -> PNGs (one per highlighted word, or one per caption) + SRT.
     let cap_dir = dir.join("captions");
+    if cap_dir.exists() {
+        std::fs::remove_dir_all(&cap_dir).map_err(|e| e.to_string())?; // our own generated PNGs only
+    }
     std::fs::create_dir_all(&cap_dir).map_err(|e| e.to_string())?;
     let font = captions::load_font()?;
-    let style = CaptionStyle::for_width(settings.width);
+    let cap_style = if look.highlight_words { CaptionStyle::reels(settings.width) } else { CaptionStyle::for_width(settings.width) };
     let mut overlays = Vec::new();
     for (i, c) in v.captions.iter().enumerate() {
-        let png = cap_dir.join(format!("{i:03}.png"));
-        captions::render_png(&font, &style, &c.text, &png)?;
-        overlays.push(Overlay { image: png, start: c.out_start, end: c.out_end, y_center_frac: CAPTION_Y_FRAC });
+        if look.highlight_words {
+            for (k, (a, b)) in caption_word_times(c, &v, &t).into_iter().enumerate() {
+                if b - a < 0.01 {
+                    continue;
+                }
+                let png = cap_dir.join(format!("{i:03}-{k:02}.png"));
+                captions::render_words_png(&font, &cap_style, &c.text, Some(k), &png)?;
+                overlays.push(Overlay { image: png, start: a, end: b, y_center_frac: CAPTION_Y_FRAC });
+            }
+        } else {
+            let png = cap_dir.join(format!("{i:03}.png"));
+            captions::render_png(&font, &cap_style, &c.text, &png)?;
+            overlays.push(Overlay { image: png, start: c.out_start, end: c.out_end, y_center_frac: CAPTION_Y_FRAC });
+        }
     }
     let srt_path = next_free(dir, "output", "srt");
     std::fs::write(&srt_path, captions::to_srt(&v.captions)).map_err(|e| e.to_string())?;
+
+    let zoom: Vec<f64> = (0..v.segments.len()).map(|k| if look.zoom && k % 2 == 1 { PUNCH_IN } else { 1.0 }).collect();
+    let sfx_times: Vec<f64> = if look.sound_effects {
+        v.segments.iter().skip(1).map(|s| (s.out_start - SFX_LEAD_SEC).max(0.0)).collect()
+    } else {
+        Vec::new()
+    };
+    let sfx = if sfx_times.is_empty() {
+        None
+    } else {
+        Some(render::Sfx { path: whoosh_path()?, times: sfx_times.clone(), gain_db: SFX_GAIN_DB })
+    };
+    write_json(&dir.join("style.json"), &StyleRecord { style: look, zoom_per_segment: zoom.clone(), sfx_times })?;
 
     let source = PathBuf::from(&info.path);
     let fps = info.fps.round() as u32;
@@ -169,6 +317,12 @@ pub fn render_plan(dir: &Path, plan_path: &Path, on_progress: impl Fn(f64)) -> R
         fps: if (1..=120).contains(&fps) { fps } else { 30 },
         fit: Fit::Crop,
         overlays,
+        style: render::Style {
+            zoom,
+            sfx,
+            music: music.map(|path| render::Music { path, gain_db: MUSIC_GAIN_DB }),
+            loudnorm: look.loudness,
+        },
     };
     let out_path = next_free(dir, "output", "mp4");
     let out = render::validate_output_path(&out_path.to_string_lossy(), &[source], false)?;
@@ -197,15 +351,19 @@ pub fn render_plan(dir: &Path, plan_path: &Path, on_progress: impl Fn(f64)) -> R
     Ok(report)
 }
 
-/// Free, offline one-shot: transcribe -> rules-based plan (no AI) -> validate -> render -> check.
+/// Free, offline one-shot: transcribe -> rules-based plan (no AI) -> validate -> styled render -> check.
 /// `stage` reports human-readable steps; `on_progress` is render progress (0-1).
 pub fn auto_cut(
     video: &str,
     root: &Path,
     language: &str,
+    look: &EditStyle,
     stage: impl Fn(&str),
     on_progress: impl Fn(f64),
 ) -> Result<(PathBuf, RenderReport), String> {
+    if let Some(m) = &look.music {
+        check_music(m)?; // fail fast, before transcribing
+    }
     stage("Transcribing…");
     let dir = prepare(video, root, language, &PlanSettings::default(), plan::DEFAULT_MODEL)?;
     stage("Planning cuts…");
@@ -215,13 +373,48 @@ pub fn auto_cut(
     write_json(&plan_path, &edit)?;
     log(&dir, &format!("auto-cut plan (rules, no AI): {} segments, {} removals, {} captions", edit.segments.len(), edit.removals.len(), edit.captions.len()));
     stage("Rendering…");
-    let report = render_plan(&dir, &plan_path, on_progress)?;
+    let report = render_plan(&dir, &plan_path, look, on_progress)?;
     Ok((dir, report))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_times_follow_transcript_or_length() {
+        use crate::plan::{ValidCaption, ValidSegment};
+        use crate::transcribe::{Interval, Word};
+        let w = |id, text: &str, start, end| Word { id, text: text.into(), start, end };
+        let t = Transcript {
+            source_id: "clip_1".into(), duration_sec: 20.0, language_requested: "auto".into(), languages_detected: vec![],
+            words: vec![w(0, "Pour", 10.0, 10.3), w(1, "the", 10.3, 10.5), w(2, "milk,", 10.5, 11.0)],
+            silences: Vec::<Interval>::new(), speech_chunks: vec![], whisper_model: "t".into(), timing_method: "t".into(),
+        };
+        let v = ValidatedPlan {
+            segments: vec![ValidSegment { start: 9.9, end: 11.1, out_start: 4.0, out_end: 5.2 }],
+            captions: vec![], total_sec: 1.2, removals_checked: 0, warnings: vec![], expected_words: vec![],
+        };
+        // Counts match -> transcript timing (mapped to output), contiguous, ends at caption end.
+        let c = ValidCaption { text: "Pour the milk,".into(), out_start: 4.0, out_end: 5.2 };
+        let times = caption_word_times(&c, &v, &t);
+        let r = |x: f64| (x * 100.0).round() / 100.0;
+        let rounded: Vec<(f64, f64)> = times.iter().map(|(a, b)| (r(*a), r(*b))).collect();
+        assert_eq!(rounded, vec![(4.0, 4.4), (4.4, 4.6), (4.6, 5.2)]);
+        // Counts differ (corrected text) -> proportional to word length.
+        let c = ValidCaption { text: "Pour milk".into(), out_start: 4.0, out_end: 5.2 };
+        let times = caption_word_times(&c, &v, &t);
+        assert_eq!(times.len(), 2);
+        assert!((times[0].1 - 4.0 - 1.2 * 4.0 / 8.0).abs() < 1e-9);
+        assert_eq!(times[1].1, 5.2);
+    }
+
+    #[test]
+    fn music_check_rejects_bad_paths() {
+        assert!(check_music("relative.mp3").is_err());
+        assert!(check_music("/tmp/notes.txt").is_err());
+        assert!(check_music("/definitely/missing/song.mp3").is_err());
+    }
 
     #[test]
     fn lcs_ratio() {

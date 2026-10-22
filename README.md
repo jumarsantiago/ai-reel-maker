@@ -87,20 +87,36 @@ How export works:
 - It never writes over a source clip. It only replaces an existing file when you confirmed that in the macOS save dialog.
 - Your original media is only read, never modified.
 
-## Auto-cut (free, no AI)
+## Auto Edit (free, no AI)
 
-In the app, select a video in the media bin and click **✨ Auto-cut (free, no AI)**. On this Mac it will:
-- transcribe the speech with whisper.cpp;
-- cut pauses longer than 0.4s, fillers (um/uh/ah/er/hmm) and repeated or restarted phrases, keeping the last attempt;
-- add captions and render a 1080×1920 reel;
-- re-transcribe the result as a check.
+In the app, select a video in the media bin and click **✨ Auto Edit (free, no AI)**. Everything runs on this Mac.
 
-Results go to `~/Movies/AI Reel Maker/<time>-<clip>/output.mp4`, and **Add to media & preview** loads the reel back into the app.
-Tagalog words like "ano" and "parang" are never cut automatically, because they're often real words. Lines are never
-reordered and the hook isn't changed; that's what the Claude planner (below) adds. CLI equivalent:
+1. **Transcribe** the speech with whisper.cpp.
+2. **Cut** pauses longer than 0.4s, fillers (um/uh/ah/er/hmm) and repeated or restarted phrases. The last attempt is kept.
+3. **Style** the reel. Each option can be switched on or off in the panel:
+   - **Zoom on cuts:** every other segment is punched in to 115%, which hides jump cuts.
+   - **Whoosh on cuts:** a soft whoosh just before each cut. The app generates the sound itself with FFmpeg, so there's no licensing issue.
+   - **Highlight spoken word:** big captions of 1–3 words, with the word being spoken shown in yellow.
+   - **Even out volume:** the final mix is normalized to −14 LUFS, with true peak at or below −1.5 dB.
+   - **Music:** optional. Choose a file you have the rights to. It's looped, and ducked by about 5 dB under speech while sitting more than 20 dB below the voice.
+4. **Render** a 1080×1920 MP4, then **check** it by re-transcribing the result.
+
+Results go to `~/Movies/AI Reel Maker/<time>-<clip>/output.mp4`, along with `style.json`, the plan and the logs.
+**Add to media & preview** loads the reel back into the app.
+
+Auto Edit never cuts the Tagalog words "ano" or "parang", because they're often real words. It never reorders lines or
+picks a hook; that's what the Claude planner (below) adds. CLI equivalent (style flags: `--plain --no-zoom --no-sfx
+--no-highlight --no-loudness --music FILE`):
 
 ```bash
-src-tauri/target/release/autoedit autocut test-media/clip-speech.mp4
+src-tauri/target/release/autoedit autocut test-media/clip-speech.mp4 --music test-media/test-music.m4a
+```
+
+Verify a styled reel (zoom-aware frame matching, caption visibility, loudness):
+
+```bash
+python3 -I scripts/verify_export.py "<project>/output.mp4" --validated "<project>/plan.validated.json" \
+  --source test-media/clip-speech.mp4 --fit crop --srt "<project>/output.srt" --style "<project>/style.json" --lufs -14
 ```
 
 The **Settings** window (top bar) stores a Claude API key in the macOS login Keychain. Only the Claude planner needs it,

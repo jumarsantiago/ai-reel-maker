@@ -123,6 +123,7 @@ export function Inspector(props: {
   motion: MotionDraft[];
   setMotion: (m: MotionDraft[]) => void;
   kit: KitStatus | null;
+  useKit: boolean;
   openSettings: () => void;
   /** Plays one graphic over the video (or a plain backdrop); resolves when the preview is on screen. */
   previewMotion: (m: MotionDraft) => Promise<void>;
@@ -372,7 +373,13 @@ export function Inspector(props: {
       <Section title="Animated graphics">
         <p className="note">Cards, stickers, arrows and lower thirds that move. They are added when you press the big button below, and are drawn by HyperFrames (the first one takes a few seconds).</p>
         <p className="note">▶ Preview plays one graphic over {props.previewOver ?? "a plain backdrop (select a video to see it over your footage)"}.</p>
-        {props.kit && !props.kit.found && (
+        {!props.useKit && (
+          <div className="callout warn" role="alert">
+            <p>herk-edit-kit is turned off, so animated graphics cannot be drawn. Turn it on, or remove the graphics below.</p>
+            <button type="button" className="btn small" onClick={props.openSettings}>Open Settings</button>
+          </div>
+        )}
+        {props.useKit && props.kit && !props.kit.found && (
           <div className="callout warn" role="alert">
             <p>{props.kit.message}</p>
             <button type="button" className="btn small" onClick={props.openSettings}>Open Settings</button>

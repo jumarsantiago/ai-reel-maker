@@ -12,7 +12,7 @@ import {
 import { FontInfo, Inspector, KitStatus } from "./Inspector.tsx";
 import {
   AutoCutResult, BatchDialog, BatchItem, ErrorDialog, ExportDialog, ExportResult, ExportState, PreviewDialog, ProgressDialog, ResultDialog,
-  ReviewDialog, ReviewState, SettingsDialog, formatSize, formatTime, plural, reviewEdits,
+  ReviewDialog, ReviewState, SettingsDialog, ClaudePlanDialog, EngineStatus, formatSize, formatTime, plural, reviewEdits,
 } from "./dialogs.tsx";
 import { Modal } from "./ui.tsx";
 import "./App.css";
@@ -61,6 +61,8 @@ function App() {
   const [extras, setExtras] = useState<ExtrasDraft>({ hook: "", tags: "" });
   const [motion, setMotion] = useState<MotionDraft[]>([]);
   const [kit, setKit] = useState<KitStatus | null>(null);
+  const [engine, setEngine] = useState<EngineStatus | null>(null);
+  const [claudeDialog, setClaudeDialog] = useState(false);
   const [fonts, setFonts] = useState<FontInfo[]>([]);
   const [fontPreview, setFontPreview] = useState<string | null>(null);
 
@@ -101,6 +103,20 @@ function App() {
     }, 400);
     return () => clearTimeout(t);
   }, [settings, userPresets, prefsLoaded]);
+
+  // The "Use Claude AI" switch is applied in the backend as soon as it is known and whenever it changes.
+  useEffect(() => {
+    if (!prefsLoaded) return;
+    invoke("set_engine", { useClaude: settings.useClaude }).catch(() => {});
+  }, [prefsLoaded, settings.useClaude]);
+
+  // A real check of both engines (Node and HyperFrames are run) at start, and when a switch or the folder changes.
+  useEffect(() => {
+    if (!prefsLoaded) return;
+    invoke<EngineStatus>("engine_status", { request: { useKit: settings.useKit, useClaude: settings.useClaude, kitDir: settings.kitDir } })
+      .then(setEngine)
+      .catch(() => setEngine(null));
+  }, [prefsLoaded, settings.useKit, settings.useClaude, settings.kitDir, settingsOpen]);
 
   // Is HyperFrames available? Checked when a graphic is added or the folder changes.
   useEffect(() => {
@@ -232,7 +248,7 @@ function App() {
 
   const timelineSegments = () =>
     plan.ok ? plan.segments.map((sg) => ({ sourcePath: sg.sourcePath, inPoint: sg.inPoint, outPoint: sg.outPoint })) : null;
-  const extrasArg = () => toExtras(extras, settings.cta, motion, settings.kitDir, settings);
+  const extrasArg = () => toExtras(extras, settings.cta, motion, settings.kitDir, settings, settings.useKit);
 
   /** Runs `work` while the progress dialog shows the stage text and render progress. */
   async function withProgress<T>(title: string, source: string, work: () => Promise<T>): Promise<T | undefined> {
@@ -357,6 +373,7 @@ function App() {
       orientation: settings.orientation,
       kitDir: settings.kitDir,
       background,
+      useKit: settings.useKit,
     });
     setPreviewTitle("Graphic preview");
     setPreviewPath(path);
@@ -448,6 +465,14 @@ function App() {
           <button className="btn small" onClick={() => setPresetName("")}>Save as preset</button>
         </div>
         <div className="topbar-actions">
+          <button className="engine-chip" onClick={() => setSettingsOpen(true)} title={engine?.kit.message ?? ""}>
+            <span className={`dot ${!settings.useKit ? "off" : engine?.kit.found && engine.kit.hyperframesVersion ? "ok" : engine ? "bad" : "off"}`} aria-hidden="true" />
+            Kit {settings.useKit ? "on" : "off"}
+          </button>
+          <button className="engine-chip" onClick={() => setSettingsOpen(true)} title={engine?.claude.message ?? ""}>
+            <span className={`dot ${!settings.useClaude ? "off" : engine?.claude.keySource === "none" ? "bad" : "ok"}`} aria-hidden="true" />
+            Claude {settings.useClaude ? "on" : "off"}
+          </button>
           <button className="btn small" onClick={() => setSettingsOpen(true)}>Settings</button>
           <button className="btn small" onClick={exportTimeline} disabled={!plan.ok || exportState.kind === "rendering"} title={plan.ok ? "Join the timeline clips into one MP4, without editing" : plan.error}>
             Export timeline
@@ -585,6 +610,7 @@ function App() {
         motion={motion}
         setMotion={setMotion}
         kit={kit}
+        useKit={settings.useKit}
         openSettings={() => setSettingsOpen(true)}
         previewMotion={previewMotion}
         previewOver={selectedClip ? selectedClip.fileName : selectedMedia?.fileName ?? null}
@@ -628,6 +654,8 @@ function App() {
       {job.kind === "error" && <ErrorDialog message={job.message} onClose={() => setJob({ kind: "idle" })} />}
       {job.kind === "done" && (
         <ResultDialog
+          useKit={settings.useKit}
+          kitDir={settings.kitDir}
           result={job.result}
           thumbnailText={extras.hook.trim() || settings.cta.trim()}
           thumbnailStyle={toTalkStyle(settings)}
@@ -637,11 +665,44 @@ function App() {
         />
       )}
       {review && job.kind === "idle" && (
-        <ReviewDialog review={review} setReview={setReview} onRender={renderReviewed} onCancel={() => setReview(null)} onPreview={previewReviewed} />
+        <ReviewDialog
+          review={review}
+          setReview={setReview}
+          onRender={renderReviewed}
+          onCancel={() => setReview(null)}
+          onPreview={previewReviewed}
+          onAskClaude={settings.useClaude ? () => setClaudeDialog(true) : undefined}
+          onUndoClaude={
+            settings.useClaude && review.claudePlan
+              ? async () => {
+                  const caps = await invoke<{ index: number; text: string; start: number; end: number }[]>("claude_undo", { projectDir: review.dir });
+                  setReview((r) => r && { ...r, claudePlan: false, captions: caps.map((c) => ({ ...c, original: c.text, deleted: false })) });
+                }
+              : null
+          }
+        />
       )}
       {previewPath && <PreviewDialog path={previewPath} title={previewTitle} onClose={() => setPreviewPath(null)} />}
       {batch && <BatchDialog items={batch.items} running={batch.running} onClose={() => setBatch(null)} />}
-      {settingsOpen && <SettingsDialog kitDir={settings.kitDir} onKitDir={(kitDir) => update({ kitDir })} onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && (
+        <SettingsDialog
+          kitDir={settings.kitDir}
+          onKitDir={(kitDir) => update({ kitDir })}
+          useKit={settings.useKit}
+          useClaude={settings.useClaude}
+          onUseKit={(useKit) => update({ useKit })}
+          onUseClaude={(useClaude) => update({ useClaude })}
+          engine={engine}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
+      {claudeDialog && review && (
+        <ClaudePlanDialog
+          projectDir={review.dir}
+          onApplied={(caps) => setReview((r) => r && { ...r, claudePlan: true, captions: caps.map((c) => ({ ...c, original: c.text, deleted: false })) })}
+          onClose={() => setClaudeDialog(false)}
+        />
+      )}
       <ExportDialog state={exportState} onClose={() => setExportState({ kind: "idle" })} />
       {presetName !== null && (
         <Modal

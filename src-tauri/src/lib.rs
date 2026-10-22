@@ -3,11 +3,14 @@ pub mod autoedit;
 pub mod autoplan;
 pub mod beats;
 pub mod captions;
+pub mod claude;
 pub mod dictionary;
+pub mod engine;
 pub mod extras;
 pub mod fonts;
 pub mod frames;
 pub mod inbox;
+pub mod kit_review;
 pub mod media;
 pub mod motion;
 pub mod plan;
@@ -418,8 +421,10 @@ async fn motion_preview(
     orientation: render::Orientation,
     kit_dir: Option<String>,
     background: Option<String>,
+    use_kit: Option<bool>,
 ) -> Result<String, String> {
     let out = tauri::async_runtime::spawn_blocking(move || {
+        motion::ensure_kit_enabled(use_kit)?;
         let kit = motion::Kit::find(kit_dir.as_deref())?;
         let bg = background.as_deref().map(std::path::Path::new);
         motion::preview(&kit, &spec, orientation, bg, &motion::cache_dir()?)
@@ -428,6 +433,84 @@ async fn motion_preview(
     .map_err(|e| format!("Preview task failed: {e}"))??;
     app.asset_protocol_scope().allow_file(&out).map_err(|e| format!("Could not enable preview: {e}"))?;
     Ok(out.to_string_lossy().into_owned())
+}
+
+/// Applies the "Use Claude AI" switch to the whole process. (The kit switch travels with each request.)
+#[tauri::command]
+fn set_engine(use_claude: bool) {
+    engine::set_claude_enabled(use_claude);
+}
+
+/// A real check of both engines: Node and HyperFrames are run, the saved key's source is looked up (never read out).
+#[tauri::command]
+async fn engine_status(request: engine::EngineRequest) -> Result<engine::EngineStatus, String> {
+    let ledger = claude::ledger_path()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        engine::status(request.use_kit, request.use_claude, request.kit_dir.as_deref(), &ledger, claude::MAX_PAID_CALLS, claude::MAX_USD)
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// The exact price of asking Claude to plan this project (counting tokens is free).
+#[tauri::command]
+async fn claude_estimate(project_dir: String) -> Result<claude::Estimate, String> {
+    let dir = checked_project_dir(&project_dir)?;
+    let ledger = claude::ledger_path()?;
+    tauri::async_runtime::spawn_blocking(move || claude::estimate(&dir, &ledger)).await.map_err(|e| e.to_string())?
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudePlanResult {
+    outcome: claude::PlanOutcome,
+    /// The captions of the plan now in use (only when Claude's plan was applied).
+    captions: Option<Vec<autoedit::CaptionDraft>>,
+}
+
+/// The one paid call, after the user confirmed the worst-case cost.
+#[tauri::command]
+async fn claude_plan(project_dir: String, confirmed_usd: f64) -> Result<ClaudePlanResult, String> {
+    let dir = checked_project_dir(&project_dir)?;
+    let ledger = claude::ledger_path()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let outcome = claude::run_plan(&dir, &ledger, confirmed_usd)?;
+        let captions = if outcome.applied { Some(autoedit::caption_drafts(&dir)?) } else { None };
+        Ok(ClaudePlanResult { outcome, captions })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Puts the rules-based plan back after a Claude plan. Returns the captions of the restored plan.
+#[tauri::command]
+async fn claude_undo(project_dir: String) -> Result<Vec<autoedit::CaptionDraft>, String> {
+    let dir = checked_project_dir(&project_dir)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        claude::undo(&dir)?;
+        autoedit::caption_drafts(&dir)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// herk-edit-kit's edit-review page for a finished Auto Edit, opened in the browser.
+#[tauri::command]
+async fn kit_edl_review(project_dir: String, video_path: String, kit_dir: Option<String>, use_kit: bool) -> Result<String, String> {
+    engine::require_kit(Some(use_kit))?;
+    let dir = checked_project_dir(&project_dir)?;
+    let video = std::fs::canonicalize(&video_path).map_err(|e| format!("Video not found: {e}"))?;
+    if !video.starts_with(&dir) {
+        return Err("That video does not belong to this project.".into());
+    }
+    let html = tauri::async_runtime::spawn_blocking(move || {
+        let kit = motion::Kit::find(kit_dir.as_deref())?;
+        kit_review::build(&kit, &dir, &video)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let _ = std::process::Command::new("/usr/bin/open").arg(&html).status();
+    Ok(html.to_string_lossy().into_owned())
 }
 
 /// Caption font choices for the picker (system and user fonts that can draw Tagalog and English).
@@ -507,9 +590,14 @@ async fn travel_edit(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|_| {
+            // The saved "Use Claude AI" switch applies from the first moment (OFF unless it was turned on).
+            engine::apply_saved();
+            Ok(())
+        })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![probe_media, export_video, api_key_status, save_api_key, remove_api_key, auto_cut, auto_cut_timeline, travel_edit, list_fonts, caption_preview, auto_cut_prepare, auto_cut_render, auto_cut_preview, travel_preview, get_prefs, set_prefs, get_dictionary, set_dictionary, make_thumbnail, kit_status, motion_preview])
+        .invoke_handler(tauri::generate_handler![probe_media, export_video, api_key_status, save_api_key, remove_api_key, auto_cut, auto_cut_timeline, travel_edit, list_fonts, caption_preview, auto_cut_prepare, auto_cut_render, auto_cut_preview, travel_preview, get_prefs, set_prefs, get_dictionary, set_dictionary, make_thumbnail, kit_status, motion_preview, set_engine, engine_status, claude_estimate, claude_plan, claude_undo, kit_edl_review])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

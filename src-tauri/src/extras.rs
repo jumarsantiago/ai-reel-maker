@@ -44,6 +44,8 @@ pub struct Extras {
     pub motion: Vec<crate::motion::MotionSpec>,
     /// The HyperFrames kit folder chosen in Settings (the usual places are tried when empty).
     pub kit_dir: Option<String>,
+    /// The "Use herk-edit-kit" switch. Missing (an older request) means ON.
+    pub use_kit: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

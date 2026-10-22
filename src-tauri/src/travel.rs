@@ -231,6 +231,7 @@ fn travel_render(
             log(&dir, &format!("motion: {n}"));
         }
         if !placed.is_empty() {
+            crate::motion::ensure_kit_enabled(x.use_kit)?;
             stage(&format!("Animating {} graphic(s)…", placed.len()));
             let kit = crate::motion::Kit::find(x.kit_dir.as_deref())?;
             plan.video_overlays = crate::motion::overlays(&kit, &placed, style.orientation, &crate::motion::cache_dir()?)?;

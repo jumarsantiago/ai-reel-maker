@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Bump when the templates change, so cached renders are redone.
-const TEMPLATE_VERSION: u32 = 3;
+const TEMPLATE_VERSION: u32 = 5;
 const DEFAULT_SEC: f64 = 3.0;
 const MIN_SEC: f64 = 1.0;
 const MAX_SEC: f64 = 12.0;
@@ -158,12 +158,12 @@ pub fn html(spec: &MotionSpec, orientation: Orientation, dur: f64) -> String {
                 format!(
                     ".card{{position:relative;overflow:hidden;width:max-content;min-width:{mw:.0}px;max-width:{xw:.0}px;padding:{py:.0}px {px:.0}px;border-radius:{r:.0}px;background:linear-gradient(135deg,{c1},{c2});color:{ink};text-align:center;border:4px solid rgba(255,255,255,.75);box-shadow:0 18px 50px rgba(0,0,0,.4)}}\
                      .t{{font-weight:900;font-size:{fs:.0}px;line-height:1.1;letter-spacing:-1px}}.sub{{margin-top:10px;font-weight:600;font-size:{fs2:.0}px;opacity:.9}}\
-                     .shine{{position:absolute;top:0;left:-60%;width:40%;height:100%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.55),transparent);transform:skewX(-20deg)}}",
+                     .shine{{position:absolute;top:0;left:0;width:40%;height:100%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.55),transparent)}}",
                     mw = 520.0 * s, xw = w as f64 * 0.86, py = 34.0 * s, px = 44.0 * s, r = 38.0 * s, fs = 78.0 * s, fs2 = 40.0 * s
                 ),
                 format!(
                     "tl.from('#el',{{y:140,scale:.55,opacity:0,duration:.55,ease:'back.out(1.8)'}},0);\
-                     tl.fromTo('.shine',{{left:'-60%'}},{{left:'130%',duration:.9,ease:'power2.inOut'}},.45);\
+                     tl.fromTo('.shine',{{xPercent:-150,skewX:-20}},{{xPercent:350,skewX:-20,duration:.9,ease:'power2.inOut'}},.45);\
                      tl.to('#el',{{y:-70,opacity:0,scale:.9,duration:.4,ease:'power2.in'}},{exit:.2});"
                 ),
             )
@@ -226,7 +226,7 @@ pub fn html(spec: &MotionSpec, orientation: Orientation, dur: f64) -> String {
             let (_, ay) = anchor(spec.position.as_deref(), "bottom", vertical);
             let sub_html = sub.as_ref().map(|t| format!("<div class=\"sub\">{t}</div>")).unwrap_or_default();
             (
-                format!("<div id=\"el\" class=\"clip\" data-start=\"0\" data-duration=\"{dur:.2}\" data-track-index=\"1\" style=\"position:absolute;left:{:.0}px;top:{:.1}%;transform:translateY(-50%)\"><div class=\"bar\"></div><div class=\"txt\"><div class=\"name\">{text}</div>{sub_html}</div></div>", w as f64 * 0.06, ay * 100.0),
+                format!("<div id=\"el\" class=\"clip\" data-start=\"0\" data-duration=\"{dur:.2}\" data-track-index=\"1\" style=\"position:absolute;left:{:.0}px;top:{:.1}%\"><div class=\"bar\"></div><div class=\"txt\"><div class=\"name\">{text}</div>{sub_html}</div></div>", w as f64 * 0.06, ay * 100.0),
                 format!(
                     "#el{{display:flex;align-items:stretch;gap:0}}.bar{{width:{bw:.0}px;border-radius:99px;background:linear-gradient(180deg,{c1},{c2});transform-origin:top}}\
                      .txt{{padding:{py:.0}px {px:.0}px;background:rgba(14,12,20,.78);border-radius:0 {r:.0}px {r:.0}px 0;color:#fff;backdrop-filter:blur(4px)}}\
@@ -234,7 +234,7 @@ pub fn html(spec: &MotionSpec, orientation: Orientation, dur: f64) -> String {
                     bw = 12.0 * s, py = 18.0 * s, px = 30.0 * s, r = 22.0 * s, fs = 58.0 * s, fs2 = 34.0 * s
                 ),
                 format!(
-                    "tl.from('.bar',{{scaleY:0,duration:.4,ease:'power3.out'}},0);\
+                    "tl.set('#el',{{yPercent:-50}},0);tl.from('.bar',{{scaleY:0,duration:.4,ease:'power3.out'}},0);\
                      tl.from('.txt',{{x:-60,opacity:0,duration:.5,ease:'power3.out'}},.2);\
                      tl.to('#el',{{x:-80,opacity:0,duration:.4,ease:'power2.in'}},{exit:.2});"
                 ),
@@ -322,6 +322,14 @@ pub fn render(kit: &Kit, spec: &MotionSpec, orientation: Orientation, dur: f64, 
     let tmp = work.join("out.webm");
     // The app may be launched from Finder with a bare PATH, so give HyperFrames the folders it needs.
     let path = format!("{}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", kit.node.parent().map(|p| p.display().to_string()).unwrap_or_default());
+    // The kit's own checker first: a broken composition is reported by name instead of failing inside the renderer.
+    let lint = Command::new(&kit.node).arg(&kit.cli).arg("lint").current_dir(&work).env("PATH", &path).stdin(Stdio::null()).output().map_err(|e| format!("Could not run HyperFrames: {e}"))?;
+    if !lint.status.success() {
+        let text = format!("{}{}", String::from_utf8_lossy(&lint.stdout), String::from_utf8_lossy(&lint.stderr));
+        let problems: Vec<&str> = text.lines().filter(|l| l.contains('\u{2717}')).map(str::trim).take(4).collect();
+        let _ = std::fs::remove_dir_all(&work);
+        return Err(format!("HyperFrames lint rejected the \"{}\" graphic:\n{}", spec.text, problems.join("\n")));
+    }
     let output = Command::new(&kit.node)
         .arg(&kit.cli)
         .args(["render", "--format", "webm", "--output"])
@@ -341,6 +349,11 @@ pub fn render(kit: &Kit, spec: &MotionSpec, orientation: Orientation, dur: f64, 
     std::fs::rename(&tmp, &out).map_err(|e| format!("Cannot save the animation: {e}"))?;
     let _ = std::fs::remove_dir_all(&work);
     Ok(out)
+}
+
+/// Stops with a clear message when `herk-edit-kit` is switched off.
+pub fn ensure_kit_enabled(use_kit: Option<bool>) -> Result<(), String> {
+    crate::engine::require_kit(use_kit).map_err(|e| format!("Animated graphics need herk-edit-kit. {e}"))
 }
 
 /// Renders every placed item (reusing cached ones, a few at a time) and returns the video overlays for the renderer.

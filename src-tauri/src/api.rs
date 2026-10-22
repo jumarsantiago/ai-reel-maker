@@ -12,6 +12,19 @@ use std::process::Command;
 use std::time::Duration;
 
 const API_BASE: &str = "https://api.anthropic.com";
+
+/// The API address. Only a loopback address in `AIRM_API_BASE` (a local test server) can replace the real one,
+/// so the API key can never be redirected to another machine.
+fn api_base() -> String {
+    let Ok(b) = std::env::var("AIRM_API_BASE") else { return API_BASE.to_string() };
+    // Exactly "http://127.0.0.1:<digits>" or "http://localhost:<digits>", with at most a trailing slash.
+    // Anything else (a path, "user@host" tricks, another host) is ignored.
+    let rest = b.strip_prefix("http://127.0.0.1:").or_else(|| b.strip_prefix("http://localhost:"));
+    match rest.map(|r| r.strip_suffix('/').unwrap_or(r)) {
+        Some(port) if !port.is_empty() && port.len() <= 5 && port.bytes().all(|c| c.is_ascii_digit()) => b.trim_end_matches('/').to_string(),
+        _ => API_BASE.to_string(),
+    }
+}
 const API_VERSION: &str = "2023-06-01";
 
 /// USD per million tokens (input, output), standard first-party pricing checked 2026-10-22.
@@ -129,6 +142,8 @@ pub fn remove_key() -> Result<KeyStatus, String> {
 
 /// Resolves the API key without printing it. Environment first, then Keychain.
 pub fn api_key() -> Result<String, String> {
+    // With "Use Claude AI" off the key is not even looked up (no environment read, no Keychain query).
+    crate::engine::require_claude()?;
     if let Ok(k) = std::env::var("ANTHROPIC_API_KEY") {
         if !k.trim().is_empty() {
             return Ok(k.trim().to_string());
@@ -152,8 +167,10 @@ fn agent() -> ureq::Agent {
 
 /// Posts JSON; returns (status, body, request-id). Non-2xx bodies are returned, not raised.
 fn post(path: &str, key: &str, body: &Value, beta: Option<&str>) -> Result<(u16, Value, String), String> {
+    // The one place every request to Claude leaves the app: refuse when "Use Claude AI" is off.
+    crate::engine::require_claude()?;
     let mut req = agent()
-        .post(&format!("{API_BASE}{path}"))
+        .post(&format!("{}{path}", api_base()))
         .set("x-api-key", key)
         .set("anthropic-version", API_VERSION)
         .set("content-type", "application/json");
@@ -185,6 +202,7 @@ fn api_error(status: u16, body: &Value, request_id: &str) -> String {
 
 /// Free token count for the exact request body (fields count_tokens doesn't take are dropped).
 pub fn count_tokens(request: &Value) -> Result<u64, String> {
+    crate::engine::require_claude()?;
     let key = api_key()?;
     let mut body = request.clone();
     if let Some(obj) = body.as_object_mut() {
@@ -285,6 +303,7 @@ pub fn request_plan(request: &Value, project: &Path, ledger_path: &Path, ledger:
     let model = request["model"].as_str().unwrap_or_default().to_string();
     let worst = cost_usd(&model, input_tokens_est, MAX_TOKENS as u64)
         .ok_or_else(|| format!("No known price for model {model}; refusing to call."))?;
+    crate::engine::require_claude()?;
     ledger.check(worst)?;
     let key = api_key()?;
 
@@ -382,5 +401,28 @@ mod tests {
         assert!(plan_from_response(&json!({"stop_reason": "max_tokens", "content": []})).unwrap_err().contains("max_tokens"));
         let bad = json!({"stop_reason": "end_turn", "content": [{"type": "text", "text": "{\"nope\": 1}"}]});
         assert!(plan_from_response(&bad).unwrap_err().contains("schema"));
+    }
+
+    /// Only a loopback address in AIRM_API_BASE can replace the real API, so the key cannot be redirected.
+    #[test]
+    fn api_base_accepts_only_loopback_overrides() {
+        let _g = crate::engine::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (value, want) in [
+            ("http://127.0.0.1:8080", "http://127.0.0.1:8080"),
+            ("http://localhost:9/", "http://localhost:9"),
+            ("https://evil.example.com", API_BASE),
+            ("http://127.0.0.1.evil.com:80", API_BASE),
+            ("http://10.0.0.5:80", API_BASE),
+            ("http://127.0.0.1:80@evil.com", API_BASE),
+            ("http://localhost:80@evil.com/", API_BASE),
+            ("http://127.0.0.1:80/v1/steal", API_BASE),
+            ("http://127.0.0.1:", API_BASE),
+            ("", API_BASE),
+        ] {
+            unsafe { std::env::set_var("AIRM_API_BASE", value) };
+            assert_eq!(api_base(), want, "{value}");
+        }
+        unsafe { std::env::remove_var("AIRM_API_BASE") };
+        assert_eq!(api_base(), API_BASE);
     }
 }

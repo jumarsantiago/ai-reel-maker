@@ -400,6 +400,7 @@ fn build_render(dir: &Path, plan_path: &Path, look: &EditStyle, main: bool, cap_
             }
             log(dir, &format!("motion: {} animation(s)", placed.len()));
             if !placed.is_empty() {
+                crate::motion::ensure_kit_enabled(extras.use_kit)?;
                 let kit = crate::motion::Kit::find(extras.kit_dir.as_deref())?;
                 video_overlays = crate::motion::overlays(&kit, &placed, look.orientation, &crate::motion::cache_dir()?)?;
             }

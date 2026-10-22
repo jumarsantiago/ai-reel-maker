@@ -264,3 +264,16 @@ dd { margin: 0; min-width: 0; }
 .motion-foot .note { min-width: 0; }
 .hook-options { border: 0; padding: 0; margin: 0; display: grid; gap: 12px; min-width: 0; }
 .hook-options:disabled { opacity: 0.5; }
+
+/* Engines */
+.engine-chip { display: inline-flex; align-items: center; gap: 7px; padding: 5px 10px; border-radius: 99px; background: var(--surface-2); border: 1px solid var(--border); font-size: 12px; cursor: pointer; }
+.engine-chip:hover { border-color: var(--border-strong); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: 0 0 auto; }
+.dot.ok { background: var(--success); box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.15); }
+.dot.bad { background: var(--danger); box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.15); }
+.dot.off { background: var(--faint); }
+.engine-detail { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; background: var(--surface-2); border-radius: var(--radius-sm); margin: 2px 0 10px; }
+.engine-detail .dot { margin-top: 6px; }
+.engine-detail p { margin: 0; }
+.tool-list { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 2px; font-size: 12px; }
+.tool-list .missing { color: var(--danger); }

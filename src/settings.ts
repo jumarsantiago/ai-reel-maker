@@ -47,6 +47,9 @@ export type Settings = {
   cta: string;
   // Where HyperFrames (the free247editor kit) is, for animated graphics; null = look in the usual places.
   kitDir: string | null;
+  // The two independent engine switches. Neither needs the other.
+  useKit: boolean; // herk-edit-kit: ON uses it for what it supports here; OFF uses only the app's own engine
+  useClaude: boolean; // Claude AI: OFF blocks every Claude request
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -85,6 +88,8 @@ export const DEFAULT_SETTINGS: Settings = {
   hookAnim: "slide",
   cta: "",
   kitDir: null,
+  useKit: true,
+  useClaude: false,
 };
 
 export type Preset = { name: string; builtIn?: boolean; settings: Partial<Settings> };
@@ -295,7 +300,7 @@ export function toHook(c: HookConfig) {
   };
 }
 
-export function toExtras(d: ExtrasDraft, cta: string, motion: MotionDraft[] = [], kitDir: string | null = null, hookCfg?: HookConfig) {
+export function toExtras(d: ExtrasDraft, cta: string, motion: MotionDraft[] = [], kitDir: string | null = null, hookCfg?: HookConfig, useKit = true) {
   const tags = d.tags
     .split("\n")
     .map((line) => line.trim())
@@ -308,7 +313,7 @@ export function toExtras(d: ExtrasDraft, cta: string, motion: MotionDraft[] = []
   const c = cta.trim();
   const m = toMotion(motion);
   if (!hook && !c && tags.length === 0 && m.length === 0) return null;
-  return { hook: hook || null, ...(hook && hookCfg ? toHook(hookCfg) : {}), tags, cta: c || null, motion: m, kitDir };
+  return { hook: hook || null, ...(hook && hookCfg ? toHook(hookCfg) : {}), tags, cta: c || null, motion: m, kitDir, useKit };
 }
 
 export type SavedPrefs = { last: Settings; presets: Preset[] };

@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Modal } from "./ui.tsx";
+import { Modal, Toggle } from "./ui.tsx";
 
 export function formatTime(sec: number) {
   const m = Math.floor(sec / 60);
@@ -58,6 +58,8 @@ export function ErrorDialog(props: { message: string; onClose: () => void }) {
 }
 
 export function ResultDialog(props: {
+  useKit: boolean;
+  kitDir: string | null;
   result: AutoCutResult;
   thumbnailText: string;
   thumbnailStyle: unknown;
@@ -67,6 +69,18 @@ export function ResultDialog(props: {
 }) {
   const r = props.result;
   const [thumb, setThumb] = useState<{ kind: "idle" } | { kind: "busy" } | { kind: "done"; path: string } | { kind: "error"; message: string }>({ kind: "idle" });
+
+  const [review, setReview] = useState<{ kind: "idle" } | { kind: "busy" } | { kind: "done" } | { kind: "error"; message: string }>({ kind: "idle" });
+
+  async function openReview() {
+    setReview({ kind: "busy" });
+    try {
+      await invoke<string>("kit_edl_review", { projectDir: r.projectDir, videoPath: r.outputPath, kitDir: props.kitDir, useKit: props.useKit });
+      setReview({ kind: "done" });
+    } catch (e) {
+      setReview({ kind: "error", message: String(e) });
+    }
+  }
 
   async function makeThumbnail() {
     setThumb({ kind: "busy" });
@@ -119,6 +133,15 @@ export function ResultDialog(props: {
             {r.otherOutputPath && <FileLine label="Other shape" path={r.otherOutputPath} />}
             {r.srtPath && <FileLine label="Captions (.srt)" path={r.srtPath} />}
           </div>
+          {r.mode === "talk" && (
+            <div className="thumb-box">
+              <button className="btn" onClick={openReview} disabled={!props.useKit || review.kind === "busy"} title={props.useKit ? "" : "Turn on \"Use herk-edit-kit\" in Settings"}>
+                {review.kind === "busy" ? "Building review…" : "🔍 Review what was cut (herk-edit-kit)"}
+              </button>
+              <p className="note">{props.useKit ? "Opens a page in your browser: kept speech in green, every cut in red, original and edited side by side." : "Needs herk-edit-kit, which is turned off."}</p>
+              {review.kind === "error" && <p className="error-text">{review.message}</p>}
+            </div>
+          )}
           <div className="thumb-box">
             {thumb.kind === "done" ? (
               <>
@@ -152,7 +175,7 @@ function FileLine(props: { label: string; path: string }) {
 }
 
 export type ReviewCaption = { index: number; text: string; start: number; end: number; original: string; deleted: boolean };
-export type ReviewState = { dir: string; sourceDurationSec: number; label: string; captions: ReviewCaption[] };
+export type ReviewState = { dir: string; sourceDurationSec: number; label: string; captions: ReviewCaption[]; claudePlan?: boolean };
 
 export function reviewEdits(r: ReviewState) {
   return r.captions
@@ -161,6 +184,9 @@ export function reviewEdits(r: ReviewState) {
 }
 
 export function ReviewDialog(props: {
+  /** Shown only when "Use Claude AI" is on. */
+  onAskClaude?: () => void;
+  onUndoClaude?: (() => Promise<void>) | null;
   review: ReviewState;
   setReview: (r: ReviewState) => void;
   onRender: () => void;
@@ -192,6 +218,8 @@ export function ReviewDialog(props: {
       footer={
         <>
           <span className="note grow">{kept} captions · {changed === 0 ? "no changes" : plural(changed, "change")}</span>
+          {props.onUndoClaude && <button className="btn" onClick={() => props.onUndoClaude?.()}>↩ Undo Claude's plan</button>}
+          {props.onAskClaude && <button className="btn" onClick={props.onAskClaude} title="Online, paid. Shows the price first.">✦ Plan with Claude…</button>}
           <button className="btn" onClick={runPreview} disabled={preview.kind === "busy"}>
             {preview.kind === "busy" ? "Making preview…" : "▶ Preview 10 s"}
           </button>
@@ -274,10 +302,131 @@ export function BatchDialog(props: { items: BatchItem[]; running: boolean; onClo
   );
 }
 
+export type EngineStatus = {
+  kit: {
+    enabled: boolean;
+    found: boolean;
+    dir: string | null;
+    nodeVersion: string | null;
+    hyperframesVersion: string | null;
+    tools: { name: string; what: string; present: boolean }[];
+    message: string;
+  };
+  claude: { enabled: boolean; keySource: string; callsMade: number; spentUsd: number; maxCalls: number; maxUsd: number; message: string };
+};
+
+type ClaudeEstimate = {
+  model: string;
+  inputTokens: number;
+  worstCaseUsd: number;
+  spentUsd: number;
+  callsMade: number;
+  maxCalls: number;
+  maxUsd: number;
+  allowed: boolean;
+  blockedReason: string | null;
+};
+
+type ClaudePlanResult = {
+  outcome: { applied: boolean; errors: string[]; costUsd: number; inputTokens: number; outputTokens: number; modelServed: string; segments: number; captions: number };
+  captions: { index: number; text: string; start: number; end: number }[] | null;
+};
+
+const usd = (n: number) => `$${n.toFixed(n < 0.1 ? 4 : 2)}`;
+
+/** Ask Claude to plan this edit: the exact price first, then one paid call only after the user confirms it. */
+export function ClaudePlanDialog(props: {
+  projectDir: string;
+  onApplied: (captions: { index: number; text: string; start: number; end: number }[]) => void;
+  onClose: () => void;
+}) {
+  const [step, setStep] = useState<
+    | { kind: "estimating" }
+    | { kind: "ready"; est: ClaudeEstimate }
+    | { kind: "running" }
+    | { kind: "done"; result: ClaudePlanResult }
+    | { kind: "error"; message: string }
+  >({ kind: "estimating" });
+
+  useEffect(() => {
+    invoke<ClaudeEstimate>("claude_estimate", { projectDir: props.projectDir })
+      .then((est) => setStep({ kind: "ready", est }))
+      .catch((e) => setStep({ kind: "error", message: String(e) }));
+  }, [props.projectDir]);
+
+  async function run(est: ClaudeEstimate) {
+    setStep({ kind: "running" });
+    try {
+      const result = await invoke<ClaudePlanResult>("claude_plan", { projectDir: props.projectDir, confirmedUsd: est.worstCaseUsd });
+      if (result.outcome.applied && result.captions) props.onApplied(result.captions);
+      setStep({ kind: "done", result });
+    } catch (e) {
+      setStep({ kind: "error", message: String(e) });
+    }
+  }
+
+  const busy = step.kind === "estimating" || step.kind === "running";
+  return (
+    <Modal
+      title="Plan this edit with Claude"
+      onClose={busy ? undefined : props.onClose}
+      footer={
+        step.kind === "ready" ? (
+          <>
+            <button className="btn" onClick={props.onClose}>Cancel</button>
+            <button className="btn primary" disabled={!step.est.allowed} onClick={() => run(step.est)}>
+              Send to Claude (up to {usd(step.est.worstCaseUsd)})
+            </button>
+          </>
+        ) : !busy ? (
+          <button className="btn primary" onClick={props.onClose}>Close</button>
+        ) : undefined
+      }
+    >
+      <div className="callout warn"><p>This uses <strong>your own Claude API key</strong> and <strong>costs money</strong>. Nothing is sent until you press the button.</p></div>
+      {step.kind === "estimating" && <p className="muted">Counting what would be sent (free)…</p>}
+      {step.kind === "ready" && (
+        <dl>
+          <dt>Model</dt><dd>{step.est.model}</dd>
+          <dt>Sends</dt><dd>{step.est.inputTokens.toLocaleString()} tokens (the transcript and rules, no video)</dd>
+          <dt>Worst-case cost</dt><dd><strong>{usd(step.est.worstCaseUsd)}</strong> for this one call</dd>
+          <dt>Used so far</dt><dd>{usd(step.est.spentUsd)} over {step.est.callsMade} call(s); limit {usd(step.est.maxUsd)} and {step.est.maxCalls} calls</dd>
+          {!step.est.allowed && <><dt>Blocked</dt><dd className="error-text">{step.est.blockedReason}</dd></>}
+        </dl>
+      )}
+      {step.kind === "running" && <><p className="muted">Waiting for Claude…</p><progress /></>}
+      {step.kind === "done" && (
+        step.result.outcome.applied ? (
+          <>
+            <p className="success">Claude's plan was checked and applied.</p>
+            <p className="note">{step.result.outcome.segments} segments, {step.result.outcome.captions} captions. It cost {usd(step.result.outcome.costUsd)}. The captions list was updated; you can undo this from the caption check.</p>
+          </>
+        ) : (
+          <>
+            <p className="error-text">Claude's plan did not pass the app's checks, so it was not used. Your current plan is unchanged.</p>
+            <pre className="error-text">{step.result.outcome.errors.slice(0, 6).join("\n")}</pre>
+            <p className="note">This call cost {usd(step.result.outcome.costUsd)}.</p>
+          </>
+        )
+      )}
+      {step.kind === "error" && <pre className="error-text" role="alert">{step.message}</pre>}
+    </Modal>
+  );
+}
+
 type KeyStatus = { source: "env" | "keychain" | "none"; account: string };
 type Fix = { from: string; to: string };
 
-export function SettingsDialog(props: { kitDir: string | null; onKitDir: (dir: string | null) => void; onClose: () => void }) {
+export function SettingsDialog(props: {
+  kitDir: string | null;
+  onKitDir: (dir: string | null) => void;
+  useKit: boolean;
+  useClaude: boolean;
+  onUseKit: (on: boolean) => void;
+  onUseClaude: (on: boolean) => void;
+  engine: EngineStatus | null;
+  onClose: () => void;
+}) {
   const [keyStatus, setKeyStatus] = useState<KeyStatus | null>(null);
   const [keyInput, setKeyInput] = useState("");
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
@@ -342,6 +491,51 @@ export function SettingsDialog(props: { kitDir: string | null; onKitDir: (dir: s
 
   return (
     <Modal title="Settings" wide onClose={() => { setKeyInput(""); props.onClose(); }}>
+      <section className="settings-section" aria-label="Engines">
+        <h3>Engines</h3>
+        <p className="note">Two separate switches. Neither one needs the other, and any mix works. Nothing switches by itself: if something needs a switch that is off, it stops and tells you which one.</p>
+        <Toggle
+          label="Use herk-edit-kit"
+          hint="Local. Draws animated graphics (HyperFrames) and builds the edit-review page. OFF: only the app's own engine is used."
+          checked={props.useKit}
+          onChange={props.onUseKit}
+        />
+        <div className="engine-detail" role="status">
+          <span className={`dot ${!props.useKit ? "off" : props.engine?.kit.found && props.engine.kit.hyperframesVersion ? "ok" : "bad"}`} aria-hidden="true" />
+          <div>
+            <p><strong>{props.engine?.kit.message ?? "Checking…"}</strong></p>
+            {props.engine?.kit.found && (
+              <p className="note">
+                {props.engine.kit.dir} · Node {props.engine.kit.nodeVersion ?? "?"} · HyperFrames {props.engine.kit.hyperframesVersion ?? "did not run"}
+              </p>
+            )}
+            {props.engine?.kit.found && (
+              <ul className="tool-list">
+                {props.engine.kit.tools.map((t) => (
+                  <li key={t.name} className={t.present ? "" : "missing"}>{t.present ? "✓" : "✗"} {t.name} <span className="muted">— {t.what}</span></li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+        <Toggle
+          label="Use Claude AI"
+          hint="Online, and it costs money. Lets you ask Claude to plan an edit, after showing the price. OFF: no request is ever sent to Claude."
+          checked={props.useClaude}
+          onChange={props.onUseClaude}
+        />
+        <div className="engine-detail" role="status">
+          <span className={`dot ${props.useClaude ? (props.engine?.claude.keySource === "none" ? "bad" : "ok") : "off"}`} aria-hidden="true" />
+          <div>
+            <p><strong>{props.engine?.claude.message ?? "Checking…"}</strong></p>
+            {props.engine && (
+              <p className="note">API key: {props.engine.claude.keySource === "none" ? "not set" : `found (${props.engine.claude.keySource})`} · used {usd(props.engine.claude.spentUsd)} over {props.engine.claude.callsMade} call(s); limit {usd(props.engine.claude.maxUsd)} / {props.engine.claude.maxCalls} calls</p>
+            )}
+          </div>
+        </div>
+        <p className="note">Works without either: opening, editing, previewing and exporting. Offline: cuts, captions, transitions, sounds, hook, thumbnails. Needs the kit: animated graphics, the edit-review page. Needs Claude and internet: the "Plan with Claude" button.</p>
+      </section>
+
       <section className="settings-section">
         <h3>Spelling fixes</h3>
         <p className="note">Corrections you made in the caption check. They are applied to new videos automatically.</p>

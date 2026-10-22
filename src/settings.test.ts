@@ -40,7 +40,7 @@ test("styles map to the Rust command fields", () => {
 test("extras: tags with and without phrases, empty means none", () => {
   assert.equal(toExtras({ hook: " ", tags: "\n" }, " "), null);
   const x = toExtras({ hook: "HOOK", tags: "A | apple\nB" }, "CTA");
-  assert.deepEqual(x, { hook: "HOOK", tags: [{ text: "A", phrase: "apple" }, { text: "B" }], cta: "CTA", motion: [], kitDir: null });
+  assert.deepEqual(x, { hook: "HOOK", tags: [{ text: "A", phrase: "apple" }, { text: "B" }], cta: "CTA", motion: [], kitDir: null, useKit: true });
 });
 
 test("restorePrefs reads user presets and drops broken ones", () => {
@@ -83,4 +83,24 @@ test("hook settings: length choices, whole video, custom time, bounds", () => {
   assert.equal(toExtras({ hook: "", tags: "" }, "CTA", [], null, base)?.hookSec, undefined);
   assert.equal(toExtras({ hook: "H", tags: "" }, "", [], null, { ...base, hookDuration: "5" })?.hookSec, 5);
   assert.equal(toExtras({ hook: "H", tags: "" }, "", [])?.hookSec, undefined, "old callers without settings still work");
+});
+
+test("engine switches: defaults, persistence, independence", () => {
+  assert.deepEqual([DEFAULT_SETTINGS.useKit, DEFAULT_SETTINGS.useClaude], [true, false], "kit on, Claude off by default");
+  // All four combinations survive a save and restore, and neither switch changes the other.
+  for (const useKit of [true, false]) {
+    for (const useClaude of [true, false]) {
+      const saved = JSON.parse(JSON.stringify({ ...DEFAULT_SETTINGS, useKit, useClaude }));
+      const back = restoreSettings(saved);
+      assert.deepEqual([back.useKit, back.useClaude], [useKit, useClaude]);
+    }
+  }
+  // Damaged values fall back to the defaults, never to "on" for Claude.
+  const s = restoreSettings({ useKit: "yes", useClaude: 1 });
+  assert.deepEqual([s.useKit, s.useClaude], [true, false]);
+  // The kit switch travels with every request that has extras; the Claude switch never does (it is applied in Rust).
+  const x = toExtras({ hook: "H", tags: "" }, "", [], null, undefined, false);
+  assert.equal(x?.useKit, false);
+  assert.equal("useClaude" in (x ?? {}), false);
+  assert.equal(toExtras({ hook: "H", tags: "" }, "", [])?.useKit, true, "old callers keep the kit on");
 });

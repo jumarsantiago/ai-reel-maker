@@ -63,6 +63,8 @@ fn paid_plan(dir: &Path) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    // The command-line tool obeys the same saved "Use Claude AI" switch as the app (OFF unless turned on there).
+    ai_reel_maker_lib::engine::apply_saved();
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
         Some("prepare") if args.len() >= 3 => {

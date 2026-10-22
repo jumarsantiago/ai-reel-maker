@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  BUILT_IN_PRESETS, DEFAULT_SETTINGS, applyPreset, newMotion, restorePrefs, restoreSettings, toExtras, toMotion, toTalkStyle, toTravelStyle,
+  BUILT_IN_PRESETS, DEFAULT_SETTINGS, applyPreset, newMotion, restorePrefs, restoreSettings, toExtras, toHook, toMotion, toTalkStyle, toTravelStyle,
 } from "./settings.ts";
 
 test("restoreSettings keeps valid fields and ignores damaged ones", () => {
@@ -67,4 +67,20 @@ test("motion drafts: seconds or phrase, empty ones dropped, kit folder passed al
   assert.equal(x?.motion.length, 1);
   assert.equal(toExtras({ hook: "", tags: "" }, "", [empty]), null);
   assert.equal(restoreSettings({ kitDir: "/k" }).kitDir, "/k");
+});
+
+test("hook settings: length choices, whole video, custom time, bounds", () => {
+  const base = { ...DEFAULT_SETTINGS };
+  assert.deepEqual(toHook(base), { hookStart: null, hookSec: 3, hookUntilEnd: false, hookSize: 1, hookPosition: "top", hookAnim: "slide" });
+  assert.equal(toHook({ ...base, hookDuration: "8" }).hookSec, 8);
+  assert.equal(toHook({ ...base, hookDuration: "custom", hookCustomSec: 12.5 }).hookSec, 12.5);
+  const whole = toHook({ ...base, hookDuration: "whole", hookStart: 2, hookSize: 150 });
+  assert.deepEqual([whole.hookUntilEnd, whole.hookSec, whole.hookStart, whole.hookSize], [true, null, 2, 1.5]);
+  // Saved values that are out of range or unknown are repaired.
+  const s = restoreSettings({ hookDuration: "forever", hookSize: 900, hookCustomSec: -4, hookPosition: "sideways", hookAnim: "spin" });
+  assert.deepEqual([s.hookDuration, s.hookSize, s.hookCustomSec, s.hookPosition, s.hookAnim], ["3", 180, 1, "top", "slide"]);
+  // The hook settings travel with the hook, and only when there is one.
+  assert.equal(toExtras({ hook: "", tags: "" }, "CTA", [], null, base)?.hookSec, undefined);
+  assert.equal(toExtras({ hook: "H", tags: "" }, "", [], null, { ...base, hookDuration: "5" })?.hookSec, 5);
+  assert.equal(toExtras({ hook: "H", tags: "" }, "", [])?.hookSec, undefined, "old callers without settings still work");
 });

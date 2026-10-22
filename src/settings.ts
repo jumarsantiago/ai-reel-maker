@@ -36,6 +36,13 @@ export type Settings = {
   duckMusic: boolean;
   musicFade: boolean;
   musicStartSec: number;
+  // Hook (the opening text): how long, when, how big, where, and how it enters
+  hookDuration: "2" | "3" | "5" | "8" | "custom" | "whole";
+  hookCustomSec: number;
+  hookStart: number;
+  hookSize: number; // percent, 60-180
+  hookPosition: "top" | "middle" | "bottom";
+  hookAnim: "none" | "fade" | "slide";
   // Reusable text
   cta: string;
   // Where HyperFrames (the free247editor kit) is, for animated graphics; null = look in the usual places.
@@ -70,6 +77,12 @@ export const DEFAULT_SETTINGS: Settings = {
   duckMusic: true,
   musicFade: true,
   musicStartSec: 0,
+  hookDuration: "3",
+  hookCustomSec: 10,
+  hookStart: 0,
+  hookSize: 100,
+  hookPosition: "top",
+  hookAnim: "slide",
   cta: "",
   kitDir: null,
 };
@@ -147,6 +160,12 @@ export function restoreSettings(saved: unknown): Settings {
   out.captionTemplate = pick(out.captionTemplate, ["soft", "clean", "blush", "dark", "classic"] as const, "soft");
   out.transition = pick(out.transition, ["smooth", "dynamic", "none"] as const, "smooth");
   out.grade = pick(out.grade, ["warm", "vivid", "natural"] as const, "warm");
+  out.hookDuration = pick(out.hookDuration, ["2", "3", "5", "8", "custom", "whole"] as const, "3");
+  out.hookPosition = pick(out.hookPosition, ["top", "middle", "bottom"] as const, "top");
+  out.hookAnim = pick(out.hookAnim, ["none", "fade", "slide"] as const, "slide");
+  out.hookCustomSec = clamp(out.hookCustomSec, 1, 600);
+  out.hookStart = clamp(out.hookStart, 0, 600);
+  out.hookSize = clamp(out.hookSize, 60, 180);
   out.musicVolume = clamp(out.musicVolume, 0, 100);
   out.videoVolume = clamp(out.videoVolume, 0, 100);
   out.musicStartSec = clamp(out.musicStartSec, 0, 3600);
@@ -260,7 +279,23 @@ export function toMotion(list: MotionDraft[]) {
 }
 
 /** Hook / tags / CTA / motion graphics for the commands. One tag per line: "TEXT" or "TEXT | phrase said in the video". */
-export function toExtras(d: ExtrasDraft, cta: string, motion: MotionDraft[] = [], kitDir: string | null = null) {
+export type HookConfig = Pick<Settings, "hookDuration" | "hookCustomSec" | "hookStart" | "hookSize" | "hookPosition" | "hookAnim">;
+
+/** The hook timing and look for the commands (only sent when there is a hook). */
+export function toHook(c: HookConfig) {
+  const whole = c.hookDuration === "whole";
+  const sec = c.hookDuration === "custom" ? c.hookCustomSec : Number(c.hookDuration) || 3;
+  return {
+    hookStart: c.hookStart > 0 ? c.hookStart : null,
+    hookSec: whole ? null : sec,
+    hookUntilEnd: whole,
+    hookSize: c.hookSize / 100,
+    hookPosition: c.hookPosition,
+    hookAnim: c.hookAnim,
+  };
+}
+
+export function toExtras(d: ExtrasDraft, cta: string, motion: MotionDraft[] = [], kitDir: string | null = null, hookCfg?: HookConfig) {
   const tags = d.tags
     .split("\n")
     .map((line) => line.trim())
@@ -273,7 +308,7 @@ export function toExtras(d: ExtrasDraft, cta: string, motion: MotionDraft[] = []
   const c = cta.trim();
   const m = toMotion(motion);
   if (!hook && !c && tags.length === 0 && m.length === 0) return null;
-  return { hook: hook || null, tags, cta: c || null, motion: m, kitDir };
+  return { hook: hook || null, ...(hook && hookCfg ? toHook(hookCfg) : {}), tags, cta: c || null, motion: m, kitDir };
 }
 
 export type SavedPrefs = { last: Settings; presets: Preset[] };

@@ -6,7 +6,7 @@
 use crate::captions::{self, CaptionStyle, CaptionTemplate};
 use crate::media::{self, MediaInfo};
 use crate::plan::{self, EditPlan, PlanSettings, ValidatedPlan};
-use crate::render::{self, Fit, Orientation, Overlay, Plan, PlannedSegment};
+use crate::render::{self, Anim, Fit, Orientation, Overlay, Plan, PlannedSegment};
 use crate::transcribe::{self, Transcript};
 use serde::Serialize;
 use std::io::Write;
@@ -383,12 +383,12 @@ fn build_render(dir: &Path, plan_path: &Path, look: &EditStyle, main: bool, cap_
                 }
                 let png = cap_dir.join(format!("{i:03}-{k:02}.png"));
                 captions::render_words_png(&font, &cap_style, &c.text, Some(k), &png)?;
-                overlays.push(Overlay { image: png, start: a, end: b, y_center_frac: cap_y });
+                overlays.push(Overlay { image: png, start: a, end: b, y_center_frac: cap_y, anim: Anim::None });
             }
         } else {
             let png = cap_dir.join(format!("{i:03}.png"));
             captions::render_png(&font, &cap_style, &c.text, &png)?;
-            overlays.push(Overlay { image: png, start: c.out_start, end: c.out_end, y_center_frac: cap_y });
+            overlays.push(Overlay { image: png, start: c.out_start, end: c.out_end, y_center_frac: cap_y, anim: Anim::None });
         }
     }
     let mut video_overlays = Vec::new();
@@ -404,7 +404,7 @@ fn build_render(dir: &Path, plan_path: &Path, look: &EditStyle, main: bool, cap_
                 video_overlays = crate::motion::overlays(&kit, &placed, look.orientation, &crate::motion::cache_dir()?)?;
             }
         }
-        let (placed, notes) = crate::extras::place(&extras, &v.captions, v.total_sec);
+        let (placed, notes) = crate::extras::place(&extras, &v.captions, v.total_sec, look.orientation);
         for n in &notes {
             log(dir, &format!("extras: {n}"));
         }
@@ -775,7 +775,10 @@ mod tests {
 
     fn project_with_transcript() -> (PathBuf, Transcript) {
         use crate::transcribe::{Interval, Word};
-        let dir = std::env::temp_dir().join(format!("arm-review-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()));
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("arm-review-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let spec = ["Sobrang", "dali", "lang", "nito,", "promise", "talaga", "mga", "ka-reels!", "Salamat", "po."];
         let mut t0 = 0.1;

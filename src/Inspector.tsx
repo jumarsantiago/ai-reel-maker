@@ -278,12 +278,76 @@ export function Inspector(props: {
 
   const text = (
     <>
-      <Section title="Hook, tags and call to action">
+      <Section title="Hook">
         <div className="field">
-          <label htmlFor="hook">Hook — first 3 seconds</label>
+          <label htmlFor="hook">Hook text</label>
           <input id="hook" type="text" placeholder="e.g. NANGANGALAY NA KAMAY MO?" value={props.extras.hook}
             onChange={(e) => props.setExtras({ ...props.extras, hook: e.target.value })} />
         </div>
+        <fieldset className="hook-options" disabled={!props.extras.hook.trim()}>
+          <div className="motion-row">
+            <SelectField
+              label="Stays for"
+              value={s.hookDuration}
+              options={[
+                { value: "2", label: "2 seconds" },
+                { value: "3", label: "3 seconds" },
+                { value: "5", label: "5 seconds" },
+                { value: "8", label: "8 seconds" },
+                { value: "custom", label: "Custom…" },
+                { value: "whole", label: "The whole video" },
+              ]}
+              onChange={(hookDuration) => update({ hookDuration })}
+            />
+            {s.hookDuration === "custom" ? (
+              <div className="field">
+                <label htmlFor="hook-custom">Seconds</label>
+                <input id="hook-custom" type="number" min={1} max={600} step={0.5} value={s.hookCustomSec}
+                  onChange={(e) => update({ hookCustomSec: Number(e.target.value) || 1 })} />
+              </div>
+            ) : (
+              <div className="field">
+                <label htmlFor="hook-start">Starts at (s)</label>
+                <input id="hook-start" type="number" min={0} max={600} step={0.5} value={s.hookStart}
+                  onChange={(e) => update({ hookStart: Math.max(0, Number(e.target.value) || 0) })} />
+              </div>
+            )}
+          </div>
+          {s.hookDuration === "custom" && (
+            <div className="field">
+              <label htmlFor="hook-start2">Starts at (s)</label>
+              <input id="hook-start2" type="number" min={0} max={600} step={0.5} value={s.hookStart}
+                onChange={(e) => update({ hookStart: Math.max(0, Number(e.target.value) || 0) })} />
+            </div>
+          )}
+          <div className="motion-row">
+            <SelectField
+              label="Place"
+              value={s.hookPosition}
+              options={[
+                { value: "top", label: "Top" },
+                { value: "middle", label: "Middle" },
+                { value: "bottom", label: "Bottom" },
+              ]}
+              onChange={(hookPosition) => update({ hookPosition })}
+            />
+            <SelectField
+              label="Enters with"
+              value={s.hookAnim}
+              options={[
+                { value: "slide", label: "Slide up" },
+                { value: "fade", label: "Fade" },
+                { value: "none", label: "No animation" },
+              ]}
+              onChange={(hookAnim) => update({ hookAnim })}
+            />
+          </div>
+          <Slider label="Hook size" value={s.hookSize} min={60} max={180} step={5} onChange={(hookSize) => update({ hookSize })} />
+          {s.hookDuration === "whole" && <p className="note">Tags then sit just under the hook so they do not overlap.</p>}
+          {s.hookPosition === "bottom" && <p className="note warn">The bottom is also where captions and the call to action go; the top is safest.</p>}
+        </fieldset>
+      </Section>
+      <Section title="Tags and call to action">
         <div className="field">
           <label htmlFor="tags">Tags — one per line{travel ? "" : ' (add "| phrase" to show it when that is said)'}</label>
           <textarea id="tags" rows={4} placeholder={travel ? "ISLAND HOPPING\nSUNSET AT CLOUD 9" : "ERGONOMIC MOUSE | ergonomic\nBLUETOOTH + DESKTOP | bluetooth"}

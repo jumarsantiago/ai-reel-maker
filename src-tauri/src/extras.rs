@@ -21,7 +21,22 @@ const MIN_SEC: f64 = 0.8;
 #[serde(rename_all = "camelCase", default)]
 pub struct Extras {
     pub hook: Option<String>,
+    /// How long the hook stays (seconds), when no end time is given. Defaults to 3.
     pub hook_sec: Option<f64>,
+    /// When the hook appears (seconds on the reel). Defaults to 0.
+    pub hook_start: Option<f64>,
+    /// When the hook goes away. Overrides `hook_sec`.
+    pub hook_end: Option<f64>,
+    /// Keep the hook up until the very end of the video.
+    pub hook_until_end: bool,
+    /// Size multiplier (1.0 = normal; 0.6 to 1.8).
+    pub hook_size: Option<f64>,
+    /// "top", "middle" or "bottom"; `hook_y` overrides it.
+    pub hook_position: Option<String>,
+    /// Exact vertical position as a fraction of the height (0.05 to 0.95), e.g. from dragging in the preview.
+    pub hook_y: Option<f64>,
+    /// "none", "fade" or "slide".
+    pub hook_anim: Option<crate::render::Anim>,
     pub tags: Vec<TagSpec>,
     pub cta: Option<String>,
     pub cta_sec: Option<f64>,
@@ -57,6 +72,35 @@ pub struct Placed {
     pub text: String,
     pub start: f64,
     pub end: f64,
+    /// Vertical position override (fraction of the height).
+    pub y: Option<f64>,
+    /// Text size multiplier.
+    pub scale: f64,
+    pub anim: crate::render::Anim,
+}
+
+impl Placed {
+    fn plain(kind: Kind, text: String, start: f64, end: f64) -> Self {
+        Placed { kind, text, start, end, y: None, scale: 1.0, anim: crate::render::Anim::None }
+    }
+}
+
+/// Seconds after which a hook is "long-lived": tags then show beneath it instead of waiting for it to leave.
+const PERSISTENT_HOOK_SEC: f64 = 6.0;
+/// How far a tag moves down to sit beneath a long-lived hook (fraction of the height).
+const TAG_UNDER_HOOK: f64 = 0.115;
+
+/// The hook's vertical position: an exact `hook_y`, else a named place, else the default.
+pub fn hook_y(extras: &Extras, orientation: Orientation) -> f64 {
+    if let Some(y) = extras.hook_y.filter(|y| y.is_finite()) {
+        return y.clamp(0.05, 0.95);
+    }
+    let vertical = orientation == Orientation::Vertical;
+    match extras.hook_position.as_deref() {
+        Some("middle") => 0.42,
+        Some("bottom") => if vertical { 0.86 } else { 0.9 },
+        _ => orientation.hook_y(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -108,16 +152,36 @@ pub fn find_phrase(captions: &[ValidCaption], phrase: &str) -> Option<f64> {
 
 /// Decides when each extra is shown. Tags never overlap the hook, the CTA or each other, and everything is
 /// clamped to the video length; anything that would be shorter than 0.8s is dropped.
-pub fn place(extras: &Extras, captions: &[ValidCaption], total: f64) -> (Vec<Placed>, Vec<String>) {
+pub fn place(extras: &Extras, captions: &[ValidCaption], total: f64, orientation: Orientation) -> (Vec<Placed>, Vec<String>) {
     let mut out = Vec::new();
     let mut notes = Vec::new();
-    let mut hook_end = 0.0;
+    let (mut hook_start, mut hook_end, mut persistent) = (0.0, 0.0, false);
     if let Some(h) = extras.hook.as_ref().filter(|h| !h.trim().is_empty()) {
-        hook_end = extras.hook_sec.unwrap_or(3.0).clamp(MIN_SEC, 6.0).min(total);
-        out.push(Placed { kind: Kind::Hook, text: h.trim().to_string(), start: 0.0, end: hook_end });
+        hook_start = extras.hook_start.filter(|s| s.is_finite()).unwrap_or(0.0).clamp(0.0, (total - MIN_SEC).max(0.0));
+        hook_end = if extras.hook_until_end {
+            total
+        } else if let Some(e) = extras.hook_end.filter(|e| e.is_finite()) {
+            e
+        } else {
+            hook_start + extras.hook_sec.unwrap_or(3.0)
+        }
+        .clamp(hook_start + MIN_SEC, total.max(hook_start + MIN_SEC))
+        .min(total);
+        persistent = extras.hook_until_end || hook_end - hook_start > PERSISTENT_HOOK_SEC;
+        out.push(Placed {
+            kind: Kind::Hook,
+            text: h.trim().to_string(),
+            start: hook_start,
+            end: hook_end,
+            y: Some(hook_y(extras, orientation)),
+            scale: extras.hook_size.filter(|s| s.is_finite()).unwrap_or(1.0).clamp(0.6, 1.8),
+            anim: extras.hook_anim.unwrap_or_default(),
+        });
     }
-    let cta_start = extras.cta.as_ref().filter(|c| !c.trim().is_empty()).map(|_| (total - extras.cta_sec.unwrap_or(3.5).clamp(MIN_SEC, 8.0)).max(hook_end));
-    let mut cursor = hook_end;
+    // A short hook is not shared with tags (they wait for it to leave); a long-lived one is, with the tags below it.
+    let tags_wait = if persistent { 0.0 } else { hook_end };
+    let cta_start = extras.cta.as_ref().filter(|c| !c.trim().is_empty()).map(|_| (total - extras.cta_sec.unwrap_or(3.5).clamp(MIN_SEC, 8.0)).max(tags_wait));
+    let mut cursor = tags_wait;
     let mut tags: Vec<(f64, &TagSpec)> = Vec::new();
     // Tags with neither a phrase nor a start time are spread evenly between the hook and the CTA.
     let free = extras.tags.iter().filter(|t| t.phrase.as_deref().map_or(true, |p| p.trim().is_empty()) && t.start.is_none() && !t.text.trim().is_empty()).count();
@@ -129,7 +193,7 @@ pub fn place(extras: &Extras, captions: &[ValidCaption], total: f64) -> (Vec<Pla
             (Some(p), None) => find_phrase(captions, p),
             (None, None) => {
                 free_i += 1;
-                Some(hook_end + (span_end - hook_end) * free_i as f64 / (free + 1) as f64 - 1.5)
+                Some(tags_wait + (span_end - tags_wait) * free_i as f64 / (free + 1) as f64 - 1.5)
             }
         };
         match want {
@@ -146,12 +210,14 @@ pub fn place(extras: &Extras, captions: &[ValidCaption], total: f64) -> (Vec<Pla
             notes.push(format!("tag \"{}\" skipped: no room at {:.1}s", t.text, s));
             continue;
         }
-        out.push(Placed { kind: Kind::Tag, text: t.text.trim().to_string(), start, end });
+        let under_hook = persistent && start < hook_end && end > hook_start;
+        let y = under_hook.then(|| (hook_y(extras, orientation) + TAG_UNDER_HOOK).min(0.95));
+        out.push(Placed { y, ..Placed::plain(Kind::Tag, t.text.trim().to_string(), start, end) });
         cursor = end;
     }
     if let (Some(c), Some(s)) = (extras.cta.as_ref(), cta_start) {
         if total - s >= MIN_SEC {
-            out.push(Placed { kind: Kind::Cta, text: c.trim().to_string(), start: s, end: total });
+            out.push(Placed::plain(Kind::Cta, c.trim().to_string(), s, total));
         }
     }
     (out, notes)
@@ -168,18 +234,20 @@ pub fn overlays(font: &FontVec, placed: &[Placed], orientation: Orientation, cap
     let width = orientation.short_side();
     let mut out = Vec::new();
     for (i, p) in placed.iter().enumerate() {
-        let (style, y) = match p.kind {
+        let (mut style, default_y) = match p.kind {
             Kind::Hook => (CaptionStyle::hook(width), orientation.hook_y()),
             Kind::Tag => (CaptionStyle::tag(width), orientation.tag_y()),
             Kind::Cta => (CaptionStyle::cta(width), orientation.cta_y()),
         };
+        style.font_px *= p.scale as f32;
+        let y = p.y.unwrap_or(default_y);
         let png = cap_dir.join(format!("x{i:02}-{:?}.png", p.kind).to_lowercase());
         let text = drawable(font, &p.text);
         if text.is_empty() {
             continue;
         }
         captions::render_png(font, &style, &text, &png)?;
-        out.push(Overlay { image: png, start: p.start, end: p.end, y_center_frac: y });
+        out.push(Overlay { image: png, start: p.start, end: p.end, y_center_frac: y, anim: p.anim });
     }
     Ok(out)
 }
@@ -205,7 +273,7 @@ mod tests {
             ..Default::default()
         };
         let caps = vec![cap("sobrang", 0.0, 2.0), cap("Ergonomic niya", 8.0, 9.0)];
-        let (p, notes) = place(&e, &caps, 20.0);
+        let (p, notes) = place(&e, &caps, 20.0, Orientation::Vertical);
         let kinds: Vec<_> = p.iter().map(|x| x.kind).collect();
         assert_eq!(kinds, vec![Kind::Hook, Kind::Tag, Kind::Tag, Kind::Cta]);
         assert_eq!((p[0].start, p[0].end), (0.0, 3.0));
@@ -232,7 +300,7 @@ mod tests {
             tags: vec![TagSpec { text: "A".into(), ..Default::default() }, TagSpec { text: "B".into(), ..Default::default() }],
             ..Default::default()
         };
-        let (p, _) = place(&e, &[], 30.0);
+        let (p, _) = place(&e, &[], 30.0, Orientation::Vertical);
         assert_eq!(p.len(), 2);
         assert!(p[0].start < p[1].start && p[0].end <= p[1].start);
     }
@@ -243,9 +311,99 @@ mod tests {
         assert_eq!(drawable(&font, "CLICK THE BASKET \u{2193}"), "CLICK THE BASKET");
     }
 
+    fn hook(h: &str) -> Extras {
+        Extras { hook: Some(h.into()), ..Default::default() }
+    }
+
+    fn hook_of(p: &[Placed]) -> &Placed {
+        p.iter().find(|x| x.kind == Kind::Hook).expect("a hook")
+    }
+
+    #[test]
+    fn hook_duration_start_end_and_until_the_end() {
+        let v = Orientation::Vertical;
+        // Default: 3 s from the start.
+        let (p, _) = place(&hook("H"), &[], 30.0, v);
+        assert_eq!((hook_of(&p).start, hook_of(&p).end), (0.0, 3.0));
+        // A custom length, longer than the old 6 s limit.
+        let (p, _) = place(&Extras { hook_sec: Some(12.0), ..hook("H") }, &[], 30.0, v);
+        assert_eq!(hook_of(&p).end, 12.0);
+        // Custom start and end win over the length.
+        let (p, _) = place(&Extras { hook_start: Some(2.0), hook_end: Some(9.5), hook_sec: Some(1.0), ..hook("H") }, &[], 30.0, v);
+        assert_eq!((hook_of(&p).start, hook_of(&p).end), (2.0, 9.5));
+        // Until the end of the video.
+        let (p, _) = place(&Extras { hook_until_end: true, hook_end: Some(4.0), ..hook("H") }, &[], 30.0, v);
+        assert_eq!((hook_of(&p).start, hook_of(&p).end), (0.0, 30.0));
+        // Edge cases: a start near the end keeps at least the minimum (0.8 s); an end before the start is pushed out;
+        // nonsense numbers fall back to the defaults; a hook never outlasts the video.
+        let (p, _) = place(&Extras { hook_start: Some(29.9), ..hook("H") }, &[], 30.0, v);
+        assert!(hook_of(&p).end - hook_of(&p).start >= MIN_SEC - 1e-9 && hook_of(&p).end <= 30.0, "{:?}", hook_of(&p));
+        let (p, _) = place(&Extras { hook_start: Some(10.0), hook_end: Some(5.0), ..hook("H") }, &[], 30.0, v);
+        assert!(hook_of(&p).end >= 10.0 + MIN_SEC - 1e-9, "an end before the start is pushed out to the minimum length");
+        let (p, _) = place(&Extras { hook_start: Some(f64::NAN), hook_end: Some(f64::INFINITY), ..hook("H") }, &[], 30.0, v);
+        assert_eq!((hook_of(&p).start, hook_of(&p).end), (0.0, 3.0), "not-a-number and infinity fall back to the defaults");
+        let (p, _) = place(&Extras { hook_sec: Some(99.0), ..hook("H") }, &[], 8.0, v);
+        assert_eq!(hook_of(&p).end, 8.0);
+        let (p, _) = place(&hook("H"), &[], 1.5, v);
+        assert!(hook_of(&p).end <= 1.5);
+        let (p, _) = place(&hook("   "), &[], 30.0, v);
+        assert!(p.is_empty(), "a blank hook is no hook");
+    }
+
+    #[test]
+    fn hook_size_position_and_animation() {
+        let v = Orientation::Vertical;
+        let (p, _) = place(&hook("H"), &[], 30.0, v);
+        assert_eq!((hook_of(&p).scale, hook_of(&p).y, hook_of(&p).anim), (1.0, Some(v.hook_y()), crate::render::Anim::None));
+        let e = Extras { hook_size: Some(5.0), hook_position: Some("middle".into()), hook_anim: Some(crate::render::Anim::Slide), ..hook("H") };
+        let (p, _) = place(&e, &[], 30.0, v);
+        assert_eq!((hook_of(&p).scale, hook_of(&p).y, hook_of(&p).anim), (1.8, Some(0.42), crate::render::Anim::Slide), "size is capped");
+        let e = Extras { hook_size: Some(0.1), hook_y: Some(2.0), hook_position: Some("bottom".into()), ..hook("H") };
+        let (p, _) = place(&e, &[], 30.0, v);
+        assert_eq!((hook_of(&p).scale, hook_of(&p).y), (0.6, Some(0.95)), "an exact y beats a named place, both are bounded");
+        assert!(hook_y(&Extras { hook_position: Some("bottom".into()), ..Default::default() }, Orientation::Horizontal) > 0.85);
+    }
+
+    #[test]
+    fn tags_wait_for_a_short_hook_but_sit_under_a_long_one() {
+        let v = Orientation::Vertical;
+        let tag = |s: f64| TagSpec { text: "T".into(), start: Some(s), dur: Some(3.0), ..Default::default() };
+        let short = Extras { tags: vec![tag(1.0)], ..hook("H") };
+        let (p, _) = place(&short, &[], 30.0, v);
+        let t = p.iter().find(|x| x.kind == Kind::Tag).unwrap();
+        assert_eq!((t.start, t.y), (3.0, None), "waits for the 3 s hook and keeps its own place");
+        let long = Extras { tags: vec![tag(1.0)], hook_until_end: true, ..hook("H") };
+        let (p, _) = place(&long, &[], 30.0, v);
+        let t = p.iter().find(|x| x.kind == Kind::Tag).unwrap();
+        assert_eq!(t.start, 1.0, "no waiting for a hook that stays");
+        assert!((t.y.unwrap() - (v.hook_y() + 0.115)).abs() < 1e-9, "sits under the hook");
+        // A tag that falls outside a timed long hook keeps its normal place.
+        let timed = Extras { tags: vec![tag(20.0)], hook_start: Some(0.0), hook_end: Some(8.0), ..hook("H") };
+        let (p, _) = place(&timed, &[], 30.0, v);
+        assert_eq!(p.iter().find(|x| x.kind == Kind::Tag).unwrap().y, None);
+    }
+
+    #[test]
+    fn overlays_apply_size_position_and_animation() {
+        let Ok(font) = captions::load_font_for(captions::SOFT_FONT) else { return };
+        let dir = std::env::temp_dir().join(format!("arm-hook-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |scale: f64| Placed { y: Some(0.3), scale, anim: crate::render::Anim::Fade, ..Placed::plain(Kind::Hook, "HELLO WORLD".into(), 0.0, 3.0) };
+        let small = overlays(&font, &[mk(0.7)], Orientation::Vertical, &dir).unwrap();
+        let big = overlays(&font, &[Placed { text: "HELLO WORLD".into(), ..mk(1.5) }], Orientation::Vertical, &dir.join("b")).unwrap_or_else(|_| {
+            std::fs::create_dir_all(dir.join("b")).unwrap();
+            overlays(&font, &[mk(1.5)], Orientation::Vertical, &dir.join("b")).unwrap()
+        });
+        assert_eq!((small[0].y_center_frac, small[0].anim), (0.3, crate::render::Anim::Fade));
+        let (w1, h1) = image::image_dimensions(&small[0].image).unwrap();
+        let (w2, h2) = image::image_dimensions(&big[0].image).unwrap();
+        assert!(w2 > w1 && h2 > h1, "a larger hook draws a larger image ({w1}x{h1} vs {w2}x{h2})");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn empty_extras_place_nothing() {
-        let (p, n) = place(&Extras::default(), &[], 10.0);
+        let (p, n) = place(&Extras::default(), &[], 10.0, Orientation::Vertical);
         assert!(p.is_empty() && n.is_empty());
     }
 }

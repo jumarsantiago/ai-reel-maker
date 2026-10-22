@@ -232,7 +232,7 @@ function App() {
 
   const timelineSegments = () =>
     plan.ok ? plan.segments.map((sg) => ({ sourcePath: sg.sourcePath, inPoint: sg.inPoint, outPoint: sg.outPoint })) : null;
-  const extrasArg = () => toExtras(extras, settings.cta, motion, settings.kitDir);
+  const extrasArg = () => toExtras(extras, settings.cta, motion, settings.kitDir, settings);
 
   /** Runs `work` while the progress dialog shows the stage text and render progress. */
   async function withProgress<T>(title: string, source: string, work: () => Promise<T>): Promise<T | undefined> {

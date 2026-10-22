@@ -262,3 +262,5 @@ dd { margin: 0; min-width: 0; }
 .callout p { font-size: 12px; }
 .motion-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .motion-foot .note { min-width: 0; }
+.hook-options { border: 0; padding: 0; margin: 0; display: grid; gap: 12px; min-width: 0; }
+.hook-options:disabled { opacity: 0.5; }

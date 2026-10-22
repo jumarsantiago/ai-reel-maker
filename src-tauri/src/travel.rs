@@ -237,7 +237,7 @@ fn travel_render(
         }
     }
     if let Some(x) = extras.filter(|x| x.hook.is_some() || x.cta.is_some() || !x.tags.is_empty()) {
-        let (placed, notes) = extras::place(x, &[], total);
+        let (placed, notes) = extras::place(x, &[], total, style.orientation);
         for n in &notes {
             log(&dir, &format!("extras: {n}"));
         }

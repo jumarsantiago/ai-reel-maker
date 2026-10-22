@@ -285,12 +285,28 @@ pub struct VideoOverlay {
     pub end: f64,
 }
 
+/// How an overlay image enters and leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Anim {
+    /// Appears and disappears at once.
+    #[default]
+    None,
+    /// Fades in and out (0.35 s).
+    Fade,
+    /// Fades in while sliding up into place.
+    Slide,
+}
+
+const ANIM_SEC: f64 = 0.35;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Overlay {
     pub image: PathBuf,
     pub start: f64,
     pub end: f64,
     pub y_center_frac: f64,
+    pub anim: Anim,
 }
 
 fn even(n: u32) -> u32 {
@@ -490,7 +506,8 @@ pub fn build_filter_graph(plan: &Plan) -> String {
         );
         prev = label;
     }
-    // Caption images follow the segment inputs; each is enabled only during its time window.
+    // Caption images follow the segment inputs; each is enabled only during its time window. An animated
+    // one is a looping image stream, so it can fade (and slide) at its start and end.
     for (k, o) in plan.overlays.iter().enumerate() {
         let last = k + 1 == plan.overlays.len();
         let label = if last { "outv".to_string() } else { format!("o{k}") };
@@ -499,11 +516,26 @@ pub fn build_filter_graph(plan: &Plan) -> String {
             (true, false) => format!(",{vfade},format=yuv420p"),
             _ => String::new(),
         };
+        let idx = n + k;
+        let src = if o.anim == Anim::None {
+            format!("{idx}:v")
+        } else {
+            let d = ANIM_SEC.min((o.end - o.start) / 2.0);
+            graph += &format!(
+                ";[{idx}:v]format=rgba,fade=t=in:st={a}:d={d:.2}:alpha=1,fade=t=out:st={b}:d={d:.2}:alpha=1[an{k}]",
+                a = secs(o.start),
+                b = secs(o.end - d),
+            );
+            format!("an{k}")
+        };
+        let y = if o.anim == Anim::Slide {
+            // Starts 70 px low and settles into place over the fade-in.
+            format!("'main_h*{y:.4}-overlay_h/2+max(0,{a}+{d:.2}-t)*{rate:.0}'", y = o.y_center_frac, a = secs(o.start), d = ANIM_SEC, rate = 70.0 / ANIM_SEC)
+        } else {
+            format!("main_h*{:.4}-overlay_h/2", o.y_center_frac)
+        };
         graph += &format!(
-            ";[{prev}][{idx}:v]overlay=x=(main_w-overlay_w)/2:y=main_h*{y:.4}-overlay_h/2:\
-             enable='between(t,{a},{b})'{tail}[{label}]",
-            idx = n + k,
-            y = o.y_center_frac,
+            ";[{prev}][{src}]overlay=x=(main_w-overlay_w)/2:y={y}:enable='between(t,{a},{b})'{tail}[{label}]",
             a = secs(o.start),
             b = secs(o.end),
         );
@@ -600,7 +632,12 @@ pub fn build_ffmpeg_args(plan: &Plan, output: &Path) -> Vec<OsString> {
     }
     for o in &plan.overlays {
         // One decoder per caption image: a single thread each, or hundreds of them exhaust macOS's per-process thread limit.
-        args.extend(["-threads", "1", "-i"].map(OsString::from));
+        args.extend(["-threads", "1"].map(OsString::from));
+        if o.anim != Anim::None {
+            // A looping stream as long as the reel, so the fade filters have frames to work on.
+            args.extend(["-loop".into(), "1".into(), "-framerate".into(), "30".into(), "-t".into(), secs(plan_total(plan)).into()]);
+        }
+        args.push("-i".into());
         args.push(o.image.clone().into_os_string());
     }
     for v in &plan.video_overlays {
@@ -896,12 +933,34 @@ mod tests {
     }
 
     #[test]
+    fn animated_overlays_fade_and_slide_from_a_looping_image() {
+        let mut plan = plan_segments(&[seg("/v/a.mp4", 0.0, 4.0)], fake_probe).unwrap();
+        plan.width = 1080;
+        plan.height = 1920;
+        plan.fit = Fit::Crop;
+        plan.overlays = vec![
+            Overlay { image: "/p/still.png".into(), start: 0.0, end: 1.0, y_center_frac: 0.7, anim: Anim::None },
+            Overlay { image: "/p/fade.png".into(), start: 1.0, end: 3.0, y_center_frac: 0.13, anim: Anim::Fade },
+            Overlay { image: "/p/slide.png".into(), start: 0.5, end: 4.0, y_center_frac: 0.13, anim: Anim::Slide },
+        ];
+        let g = build_filter_graph(&plan);
+        assert!(g.contains(";[2:v]format=rgba,fade=t=in:st=1.000:d=0.35:alpha=1,fade=t=out:st=2.650:d=0.35:alpha=1[an1]"), "{g}");
+        assert!(g.contains("[o0][an1]overlay=x=(main_w-overlay_w)/2:y=main_h*0.1300-overlay_h/2:enable='between(t,1.000,3.000)'[o1]"), "{g}");
+        assert!(g.contains("[o1][an2]overlay=x=(main_w-overlay_w)/2:y='main_h*0.1300-overlay_h/2+max(0,0.500+0.35-t)*200'"), "{g}");
+        assert!(g.contains("[0:v:0]") && g.contains("[o0][1:v]") == false && g.contains("[cv][1:v]overlay"), "stills still use the plain input: {g}");
+        let args: Vec<String> = build_ffmpeg_args(&plan, Path::new("/o.mp4")).into_iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let loops = args.iter().filter(|a| *a == "-loop").count();
+        assert_eq!(loops, 2, "only animated images loop: {args:?}");
+        assert!(args.windows(6).any(|w| w[0] == "-loop" && w[1] == "1" && w[2] == "-framerate" && w[3] == "30" && w[4] == "-t" && w[5] == "4.000"));
+    }
+
+    #[test]
     fn motion_overlays_sit_under_captions_and_keep_inputs_in_order() {
         let mut plan = plan_segments(&[seg("/v/a.mp4", 0.0, 4.0)], fake_probe).unwrap();
         plan.width = 1080;
         plan.height = 1920;
         plan.fit = Fit::Crop;
-        plan.overlays = vec![Overlay { image: "/p/c.png".into(), start: 0.0, end: 1.0, y_center_frac: 0.7 }];
+        plan.overlays = vec![Overlay { image: "/p/c.png".into(), start: 0.0, end: 1.0, y_center_frac: 0.7, anim: Anim::None }];
         plan.video_overlays = vec![
             VideoOverlay { path: "/m/a.webm".into(), start: 1.5, end: 4.0 },
             VideoOverlay { path: "/m/b.webm".into(), start: 2.0, end: 4.0 },
@@ -938,7 +997,7 @@ mod tests {
             args.windows(2).any(|w| w[0] == "-filter_complex_threads" && w[1] == "1")
         };
         assert!(!has(&plan));
-        plan.overlays = (0..=MANY_OVERLAYS).map(|i| Overlay { image: format!("/p/{i}.png").into(), start: 0.0, end: 1.0, y_center_frac: 0.7 }).collect();
+        plan.overlays = (0..=MANY_OVERLAYS).map(|i| Overlay { image: format!("/p/{i}.png").into(), start: 0.0, end: 1.0, y_center_frac: 0.7, anim: Anim::None }).collect();
         assert!(has(&plan));
     }
 
@@ -961,8 +1020,8 @@ mod tests {
         plan.height = 1920;
         plan.fit = Fit::Crop;
         plan.overlays = vec![
-            Overlay { image: "/p/000.png".into(), start: 0.0, end: 1.5, y_center_frac: 0.7 },
-            Overlay { image: "/p/001.png".into(), start: 1.5, end: 3.0, y_center_frac: 0.7 },
+            Overlay { image: "/p/000.png".into(), start: 0.0, end: 1.5, y_center_frac: 0.7, anim: Anim::None },
+            Overlay { image: "/p/001.png".into(), start: 1.5, end: 3.0, y_center_frac: 0.7, anim: Anim::None },
         ];
         let g = build_filter_graph(&plan);
         assert!(g.contains("scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"));
@@ -981,7 +1040,7 @@ mod tests {
         plan.width = 1080;
         plan.height = 1920;
         plan.fit = Fit::Crop;
-        plan.overlays = vec![Overlay { image: "/p/0.png".into(), start: 0.0, end: 1.0, y_center_frac: 0.7 }];
+        plan.overlays = vec![Overlay { image: "/p/0.png".into(), start: 0.0, end: 1.0, y_center_frac: 0.7, anim: Anim::None }];
         plan.style = Style {
             zoom: vec![1.0, 1.15],
             sfx: Some(Sfx { path: "/fx/whoosh.wav".into(), times: vec![1.9], gain_db: -12.0 }),
@@ -1022,9 +1081,9 @@ mod tests {
     fn truncated_plan_keeps_only_the_first_seconds() {
         let mut plan = plan_segments(&[seg("/v/a.mp4", 0.0, 4.0), seg("/v/a.mp4", 0.0, 4.0), seg("/v/a.mp4", 0.0, 4.0)], fake_probe).unwrap();
         plan.overlays = vec![
-            Overlay { image: "/p/a.png".into(), start: 1.0, end: 2.0, y_center_frac: 0.7 },
-            Overlay { image: "/p/b.png".into(), start: 5.5, end: 7.0, y_center_frac: 0.7 },
-            Overlay { image: "/p/c.png".into(), start: 9.0, end: 10.0, y_center_frac: 0.7 },
+            Overlay { image: "/p/a.png".into(), start: 1.0, end: 2.0, y_center_frac: 0.7, anim: Anim::None },
+            Overlay { image: "/p/b.png".into(), start: 5.5, end: 7.0, y_center_frac: 0.7, anim: Anim::None },
+            Overlay { image: "/p/c.png".into(), start: 9.0, end: 10.0, y_center_frac: 0.7, anim: Anim::None },
         ];
         let p = plan.truncated(6.0);
         assert_eq!(p.segments.len(), 2);

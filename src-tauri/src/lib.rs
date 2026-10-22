@@ -4,6 +4,7 @@ pub mod autoplan;
 pub mod beats;
 pub mod captions;
 pub mod claude;
+pub mod claude_code;
 pub mod dictionary;
 pub mod engine;
 pub mod extras;
@@ -482,6 +483,34 @@ async fn claude_plan(project_dir: String, confirmed_usd: f64) -> Result<ClaudePl
     .map_err(|e| e.to_string())?
 }
 
+/// Is Claude Code (the user's `claude` command) installed and logged in?
+#[tauri::command]
+async fn claude_code_status() -> Result<claude_code::CliStatus, String> {
+    engine::require_claude()?;
+    tauri::async_runtime::spawn_blocking(|| claude_code::status(None)).await.map_err(|e| e.to_string())
+}
+
+/// Asks Claude Code (the user's subscription, not the API) to plan this edit. It can take a few minutes.
+#[tauri::command]
+async fn claude_code_plan(project_dir: String) -> Result<ClaudePlanResult, String> {
+    engine::require_claude()?;
+    let dir = checked_project_dir(&project_dir)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let cli = claude_code::find_cli().ok_or(claude_code::INSTALL_HELP)?;
+        let outcome = claude_code::run_plan(&dir, &cli, claude_code::DEFAULT_TIMEOUT)?;
+        let captions = if outcome.applied { Some(autoedit::caption_drafts(&dir)?) } else { None };
+        Ok(ClaudePlanResult { outcome, captions })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Stops a running Claude Code request.
+#[tauri::command]
+fn claude_code_cancel() -> bool {
+    claude_code::cancel()
+}
+
 /// Puts the rules-based plan back after a Claude plan. Returns the captions of the restored plan.
 #[tauri::command]
 async fn claude_undo(project_dir: String) -> Result<Vec<autoedit::CaptionDraft>, String> {
@@ -597,7 +626,7 @@ pub fn run() {
         })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![probe_media, export_video, api_key_status, save_api_key, remove_api_key, auto_cut, auto_cut_timeline, travel_edit, list_fonts, caption_preview, auto_cut_prepare, auto_cut_render, auto_cut_preview, travel_preview, get_prefs, set_prefs, get_dictionary, set_dictionary, make_thumbnail, kit_status, motion_preview, set_engine, engine_status, claude_estimate, claude_plan, claude_undo, kit_edl_review])
+        .invoke_handler(tauri::generate_handler![probe_media, export_video, api_key_status, save_api_key, remove_api_key, auto_cut, auto_cut_timeline, travel_edit, list_fonts, caption_preview, auto_cut_prepare, auto_cut_render, auto_cut_preview, travel_preview, get_prefs, set_prefs, get_dictionary, set_dictionary, make_thumbnail, kit_status, motion_preview, set_engine, engine_status, claude_estimate, claude_plan, claude_undo, kit_edl_review, claude_code_status, claude_code_plan, claude_code_cancel])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Modal, Toggle } from "./ui.tsx";
+import { Modal, Segmented, Toggle } from "./ui.tsx";
 
 export function formatTime(sec: number) {
   const m = Math.floor(sec / 60);
@@ -313,6 +313,7 @@ export type EngineStatus = {
     message: string;
   };
   claude: { enabled: boolean; keySource: string; callsMade: number; spentUsd: number; maxCalls: number; maxUsd: number; message: string };
+  claudeCode: { installed: boolean; path: string | null; version: string | null; loggedIn: boolean; authMethod: string | null; message: string } | null;
 };
 
 type ClaudeEstimate = {
@@ -336,26 +337,49 @@ const usd = (n: number) => `$${n.toFixed(n < 0.1 ? 4 : 2)}`;
 
 /** Ask Claude to plan this edit: the exact price first, then one paid call only after the user confirms it. */
 export function ClaudePlanDialog(props: {
+  method: "code" | "api";
+  onMethod: (m: "code" | "api") => void;
   projectDir: string;
   onApplied: (captions: { index: number; text: string; start: number; end: number }[]) => void;
   onClose: () => void;
 }) {
+  type Cli = { installed: boolean; loggedIn: boolean; version: string | null; message: string };
   const [step, setStep] = useState<
     | { kind: "estimating" }
     | { kind: "ready"; est: ClaudeEstimate }
-    | { kind: "running" }
+    | { kind: "code-ready"; cli: Cli }
+    | { kind: "running"; code: boolean }
     | { kind: "done"; result: ClaudePlanResult }
     | { kind: "error"; message: string }
   >({ kind: "estimating" });
 
+  // What the user sees first depends on the route: the exact price (API), or whether Claude Code is ready.
   useEffect(() => {
-    invoke<ClaudeEstimate>("claude_estimate", { projectDir: props.projectDir })
-      .then((est) => setStep({ kind: "ready", est }))
-      .catch((e) => setStep({ kind: "error", message: String(e) }));
-  }, [props.projectDir]);
+    setStep({ kind: "estimating" });
+    if (props.method === "api") {
+      invoke<ClaudeEstimate>("claude_estimate", { projectDir: props.projectDir })
+        .then((est) => setStep({ kind: "ready", est }))
+        .catch((e) => setStep({ kind: "error", message: String(e) }));
+    } else {
+      invoke<Cli>("claude_code_status")
+        .then((cli) => setStep({ kind: "code-ready", cli }))
+        .catch((e) => setStep({ kind: "error", message: String(e) }));
+    }
+  }, [props.projectDir, props.method]);
+
+  async function runCode() {
+    setStep({ kind: "running", code: true });
+    try {
+      const result = await invoke<ClaudePlanResult>("claude_code_plan", { projectDir: props.projectDir });
+      if (result.outcome.applied && result.captions) props.onApplied(result.captions);
+      setStep({ kind: "done", result });
+    } catch (e) {
+      setStep({ kind: "error", message: String(e) });
+    }
+  }
 
   async function run(est: ClaudeEstimate) {
-    setStep({ kind: "running" });
+    setStep({ kind: "running", code: false });
     try {
       const result = await invoke<ClaudePlanResult>("claude_plan", { projectDir: props.projectDir, confirmedUsd: est.worstCaseUsd });
       if (result.outcome.applied && result.captions) props.onApplied(result.captions);
@@ -371,7 +395,14 @@ export function ClaudePlanDialog(props: {
       title="Plan this edit with Claude"
       onClose={busy ? undefined : props.onClose}
       footer={
-        step.kind === "ready" ? (
+        step.kind === "code-ready" ? (
+          <>
+            <button className="btn" onClick={props.onClose}>Cancel</button>
+            <button className="btn primary" disabled={!step.cli.installed || !step.cli.loggedIn} onClick={runCode}>Let Claude Code plan it</button>
+          </>
+        ) : step.kind === "running" && step.code ? (
+          <button className="btn danger" onClick={() => invoke("claude_code_cancel")}>Stop Claude Code</button>
+        ) : step.kind === "ready" ? (
           <>
             <button className="btn" onClick={props.onClose}>Cancel</button>
             <button className="btn primary" disabled={!step.est.allowed} onClick={() => run(step.est)}>
@@ -383,8 +414,28 @@ export function ClaudePlanDialog(props: {
         ) : undefined
       }
     >
-      <div className="callout warn"><p>This uses <strong>your own Claude API key</strong> and <strong>costs money</strong>. Nothing is sent until you press the button.</p></div>
-      {step.kind === "estimating" && <p className="muted">Counting what would be sent (free)…</p>}
+      <Segmented
+        label="How to reach Claude"
+        value={props.method}
+        options={[
+          { value: "code", label: "Claude Code (your subscription)" },
+          { value: "api", label: "API key (pay per use)" },
+        ]}
+        onChange={(m) => !busy && props.onMethod(m)}
+      />
+      {props.method === "api" ? (
+        <div className="callout warn"><p>This uses <strong>your own Claude API key</strong> and <strong>costs money</strong>. Nothing is sent until you press the button.</p></div>
+      ) : (
+        <div className="callout"><p>This runs <strong>Claude Code</strong> on this Mac with <strong>your Claude subscription</strong>, so there is no API charge, but it uses your plan's usage limits and can take a few minutes. It can only read and write inside this edit's folder. Nothing runs until you press the button.</p></div>
+      )}
+      {step.kind === "estimating" && <p className="muted">{props.method === "api" ? "Counting what would be sent (free)…" : "Checking Claude Code…"}</p>}
+      {step.kind === "code-ready" && (
+        <dl>
+          <dt>Claude Code</dt><dd>{step.cli.installed ? `installed (${step.cli.version ?? "version unknown"})` : "not installed"}</dd>
+          <dt>Login</dt><dd>{step.cli.loggedIn ? "logged in" : "not logged in"}</dd>
+          <dt>Status</dt><dd className={step.cli.installed && step.cli.loggedIn ? "success" : "error-text"}>{step.cli.message}</dd>
+        </dl>
+      )}
       {step.kind === "ready" && (
         <dl>
           <dt>Model</dt><dd>{step.est.model}</dd>
@@ -394,18 +445,18 @@ export function ClaudePlanDialog(props: {
           {!step.est.allowed && <><dt>Blocked</dt><dd className="error-text">{step.est.blockedReason}</dd></>}
         </dl>
       )}
-      {step.kind === "running" && <><p className="muted">Waiting for Claude…</p><progress /></>}
+      {step.kind === "running" && <><p className="muted">{step.code ? "Claude Code is reading the transcript and writing a plan. This can take a few minutes…" : "Waiting for Claude…"}</p><progress /></>}
       {step.kind === "done" && (
         step.result.outcome.applied ? (
           <>
             <p className="success">Claude's plan was checked and applied.</p>
-            <p className="note">{step.result.outcome.segments} segments, {step.result.outcome.captions} captions. It cost {usd(step.result.outcome.costUsd)}. The captions list was updated; you can undo this from the caption check.</p>
+            <p className="note">{step.result.outcome.segments} segments, {step.result.outcome.captions} captions. {props.method === "api" ? `It cost ${usd(step.result.outcome.costUsd)}.` : "No API charge (it used your subscription)."} The captions list was updated; you can undo this from the caption check.</p>
           </>
         ) : (
           <>
             <p className="error-text">Claude's plan did not pass the app's checks, so it was not used. Your current plan is unchanged.</p>
             <pre className="error-text">{step.result.outcome.errors.slice(0, 6).join("\n")}</pre>
-            <p className="note">This call cost {usd(step.result.outcome.costUsd)}.</p>
+            {props.method === "api" && <p className="note">This call cost {usd(step.result.outcome.costUsd)}.</p>}
           </>
         )
       )}
@@ -533,7 +584,16 @@ export function SettingsDialog(props: {
             )}
           </div>
         </div>
-        <p className="note">Works without either: opening, editing, previewing and exporting. Offline: cuts, captions, transitions, sounds, hook, thumbnails. Needs the kit: animated graphics, the edit-review page. Needs Claude and internet: the "Plan with Claude" button.</p>
+        {props.useClaude && props.engine?.claudeCode && (
+          <div className="engine-detail" role="status">
+            <span className={`dot ${props.engine.claudeCode.installed && props.engine.claudeCode.loggedIn ? "ok" : "bad"}`} aria-hidden="true" />
+            <div>
+              <p><strong>Claude Code: {props.engine.claudeCode.installed ? (props.engine.claudeCode.loggedIn ? "ready" : "not logged in") : "not installed"}</strong></p>
+              <p className="note">{props.engine.claudeCode.message}{props.engine.claudeCode.version ? ` (${props.engine.claudeCode.version})` : ""}</p>
+            </div>
+          </div>
+        )}
+        <p className="note">Works without either: opening, editing, previewing and exporting. Offline: cuts, captions, transitions, sounds, hook, thumbnails. Needs the kit: animated graphics, the edit-review page. Needs Claude and internet: the "Plan with Claude" button (Claude Code uses your subscription; the API key route is pay per use).</p>
       </section>
 
       <section className="settings-section">

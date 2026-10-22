@@ -698,6 +698,8 @@ function App() {
       )}
       {claudeDialog && review && (
         <ClaudePlanDialog
+          method={settings.claudeMethod}
+          onMethod={(claudeMethod) => update({ claudeMethod })}
           projectDir={review.dir}
           onApplied={(caps) => setReview((r) => r && { ...r, claudePlan: true, captions: caps.map((c) => ({ ...c, original: c.text, deleted: false })) })}
           onClose={() => setClaudeDialog(false)}

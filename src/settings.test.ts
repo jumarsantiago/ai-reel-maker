@@ -104,3 +104,10 @@ test("engine switches: defaults, persistence, independence", () => {
   assert.equal("useClaude" in (x ?? {}), false);
   assert.equal(toExtras({ hook: "H", tags: "" }, "", [])?.useKit, true, "old callers keep the kit on");
 });
+
+test("Claude method: defaults to Claude Code (subscription) and repairs bad values", () => {
+  assert.equal(DEFAULT_SETTINGS.claudeMethod, "code");
+  assert.equal(restoreSettings({ claudeMethod: "api" }).claudeMethod, "api");
+  assert.equal(restoreSettings({ claudeMethod: "magic" }).claudeMethod, "code");
+  assert.equal(DEFAULT_SETTINGS.useClaude, false, "choosing a method never turns Claude on");
+});

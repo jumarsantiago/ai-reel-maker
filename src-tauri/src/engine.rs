@@ -108,6 +108,8 @@ pub struct ClaudeReport {
 pub struct EngineStatus {
     pub kit: KitReport,
     pub claude: ClaudeReport,
+    /// Claude Code (the user's own `claude` command and login). Checked only while "Use Claude AI" is on.
+    pub claude_code: Option<crate::claude_code::CliStatus>,
 }
 
 fn run_version(program: &Path, args: &[&std::ffi::OsStr]) -> Option<String> {
@@ -156,7 +158,11 @@ pub fn claude_report(enabled: bool, ledger_path: &Path, max_calls: u32, max_usd:
 
 /// Both reports. `use_kit` and `use_claude` are the switches as shown in the UI.
 pub fn status(use_kit: bool, use_claude: bool, kit_dir: Option<&str>, ledger_path: &Path, max_calls: u32, max_usd: f64) -> EngineStatus {
-    EngineStatus { kit: kit_report(use_kit, kit_dir), claude: claude_report(use_claude, ledger_path, max_calls, max_usd) }
+    EngineStatus {
+        kit: kit_report(use_kit, kit_dir),
+        claude: claude_report(use_claude, ledger_path, max_calls, max_usd),
+        claude_code: use_claude.then(|| crate::claude_code::status(None)),
+    }
 }
 
 /// Only ever used in tests that change the process-wide Claude switch: they must not run at the same time.

@@ -97,7 +97,7 @@ pub fn run_plan(dir: &Path, ledger: &Path, confirmed_usd: f64) -> Result<PlanOut
     std::fs::write(dir.join("api_usage.json"), serde_json::to_string_pretty(&r).map_err(|e| e.to_string())? + "\n").map_err(|e| e.to_string())?;
     crate::autoedit::log(dir, &format!("Claude plan: {} in {:.1}s, {} in / {} out tokens, ${:.4}", r.model_served, r.seconds, r.input_tokens, r.output_tokens, r.cost_usd));
 
-    let transcript: Transcript = serde_json::from_value(read_json(&dir.join("transcript.json"))?).map_err(|e| format!("Invalid transcript.json: {e}"))?;
+    let transcript = read_transcript(dir)?;
     let mut outcome = PlanOutcome {
         applied: false,
         errors: Vec::new(),
@@ -108,21 +108,33 @@ pub fn run_plan(dir: &Path, ledger: &Path, confirmed_usd: f64) -> Result<PlanOut
         segments: edit.segments.len(),
         captions: edit.captions.len(),
     };
-    match plan::validate(&edit, &transcript) {
-        Err(errors) => outcome.errors = errors,
+    outcome.errors = adopt_plan(dir, &edit, &transcript)?;
+    outcome.applied = outcome.errors.is_empty();
+    Ok(outcome)
+}
+
+pub(crate) fn read_transcript(dir: &Path) -> Result<Transcript, String> {
+    serde_json::from_value(read_json(&dir.join("transcript.json"))?).map_err(|e| format!("Invalid transcript.json: {e}"))
+}
+
+/// Checks a plan from Claude (by either route) with the same validator as the rules-based plan. If it passes it
+/// replaces `plan.autocut.json` (the rules-based plan is kept as `plan.autocut.rules.json`, once, so it can be
+/// undone) and `Ok(vec![])` is returned. If it fails, nothing changes and the reasons are returned.
+pub(crate) fn adopt_plan(dir: &Path, edit: &EditPlan, transcript: &Transcript) -> Result<Vec<String>, String> {
+    match plan::validate(edit, transcript) {
+        Err(errors) => Ok(errors),
         Ok(_) => {
             let current = dir.join("plan.autocut.json");
             let keep = dir.join("plan.autocut.rules.json");
             if !keep.exists() {
                 std::fs::copy(&current, &keep).map_err(|e| format!("Cannot keep the rules-based plan: {e}"))?;
             }
-            write_plan(&current, &edit)?;
+            write_plan(&current, edit)?;
             // Caption edits are applied on top of the first plan; the plan just changed, so start that fresh.
             let _ = std::fs::remove_file(dir.join("plan.autocut.original.json"));
-            outcome.applied = true;
+            Ok(Vec::new())
         }
     }
-    Ok(outcome)
 }
 
 fn write_plan(path: &Path, edit: &EditPlan) -> Result<(), String> {

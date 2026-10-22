@@ -50,6 +50,8 @@ export type Settings = {
   // The two independent engine switches. Neither needs the other.
   useKit: boolean; // herk-edit-kit: ON uses it for what it supports here; OFF uses only the app's own engine
   useClaude: boolean; // Claude AI: OFF blocks every Claude request
+  // How Claude is reached when it is on: Claude Code (your subscription) or the API (pay per use).
+  claudeMethod: "code" | "api";
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -90,6 +92,7 @@ export const DEFAULT_SETTINGS: Settings = {
   kitDir: null,
   useKit: true,
   useClaude: false,
+  claudeMethod: "code",
 };
 
 export type Preset = { name: string; builtIn?: boolean; settings: Partial<Settings> };
@@ -165,6 +168,7 @@ export function restoreSettings(saved: unknown): Settings {
   out.captionTemplate = pick(out.captionTemplate, ["soft", "clean", "blush", "dark", "classic"] as const, "soft");
   out.transition = pick(out.transition, ["smooth", "dynamic", "none"] as const, "smooth");
   out.grade = pick(out.grade, ["warm", "vivid", "natural"] as const, "warm");
+  out.claudeMethod = pick(out.claudeMethod, ["code", "api"] as const, "code");
   out.hookDuration = pick(out.hookDuration, ["2", "3", "5", "8", "custom", "whole"] as const, "3");
   out.hookPosition = pick(out.hookPosition, ["top", "middle", "bottom"] as const, "top");
   out.hookAnim = pick(out.hookAnim, ["none", "fade", "slide"] as const, "slide");

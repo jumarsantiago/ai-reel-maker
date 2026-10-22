@@ -225,6 +225,17 @@ fn travel_render(
     let cap_dir = dir.join("captions");
     std::fs::create_dir_all(&cap_dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
     let total = render::plan_total(&plan);
+    if let Some(x) = extras.filter(|x| !x.motion.is_empty()) {
+        let (placed, notes) = crate::motion::place(&x.motion, &[], total);
+        for n in &notes {
+            log(&dir, &format!("motion: {n}"));
+        }
+        if !placed.is_empty() {
+            stage(&format!("Animating {} graphic(s)…", placed.len()));
+            let kit = crate::motion::Kit::find(x.kit_dir.as_deref())?;
+            plan.video_overlays = crate::motion::overlays(&kit, &placed, style.orientation, &crate::motion::cache_dir()?)?;
+        }
+    }
     if let Some(x) = extras.filter(|x| x.hook.is_some() || x.cta.is_some() || !x.tags.is_empty()) {
         let (placed, notes) = extras::place(x, &[], total);
         for n in &notes {

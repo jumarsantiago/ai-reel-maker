@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { open } from "@tauri-apps/plugin-dialog";
 import { Modal } from "./ui.tsx";
 
 export function formatTime(sec: number) {
@@ -237,10 +238,10 @@ export function ReviewDialog(props: {
   );
 }
 
-export function PreviewDialog(props: { path: string; onClose: () => void }) {
+export function PreviewDialog(props: { path: string; title?: string; onClose: () => void }) {
   const [at] = useState(Date.now());
   return (
-    <Modal title="Preview — first 10 seconds" onClose={props.onClose} footer={<button className="btn primary" onClick={props.onClose}>Close</button>}>
+    <Modal title={props.title ?? "Preview — first 10 seconds"} onClose={props.onClose} footer={<button className="btn primary" onClick={props.onClose}>Close</button>}>
       <video className="preview-video" src={`${convertFileSrc(props.path)}?t=${at}`} controls autoPlay />
       <p className="note">A quick, lower-quality version. The final reel is sharper.</p>
     </Modal>
@@ -276,13 +277,23 @@ export function BatchDialog(props: { items: BatchItem[]; running: boolean; onClo
 type KeyStatus = { source: "env" | "keychain" | "none"; account: string };
 type Fix = { from: string; to: string };
 
-export function SettingsDialog(props: { onClose: () => void }) {
+export function SettingsDialog(props: { kitDir: string | null; onKitDir: (dir: string | null) => void; onClose: () => void }) {
   const [keyStatus, setKeyStatus] = useState<KeyStatus | null>(null);
   const [keyInput, setKeyInput] = useState("");
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [saving, setSaving] = useState(false);
   const [fixes, setFixes] = useState<Fix[] | null>(null);
   const [dictMsg, setDictMsg] = useState<string | null>(null);
+  const [kit, setKit] = useState<{ found: boolean; dir: string | null; message: string } | null>(null);
+
+  useEffect(() => {
+    invoke<{ found: boolean; dir: string | null; message: string }>("kit_status", { dir: props.kitDir }).then(setKit).catch(() => setKit(null));
+  }, [props.kitDir]);
+
+  async function chooseKit() {
+    const picked = await open({ directory: true, multiple: false, title: "Choose the free247editor kit folder" });
+    if (typeof picked === "string") props.onKitDir(picked);
+  }
 
   useEffect(() => {
     invoke<KeyStatus>("api_key_status").then(setKeyStatus).catch((e) => setMsg({ ok: false, text: String(e) }));
@@ -354,6 +365,17 @@ export function SettingsDialog(props: { onClose: () => void }) {
             </div>
           </div>
         )}
+      </section>
+
+      <section className="settings-section">
+        <h3>Animated graphics (HyperFrames)</h3>
+        <p className="note">Motion cards, stickers and arrows are drawn by HyperFrames, which comes with the free247editor kit. Choose its <strong>kit</strong> folder if it is not found automatically.</p>
+        <div className="file-row">
+          <span className={`file-name${kit?.found ? "" : " empty"}`} title={kit?.dir ?? ""}>{kit?.found ? kit.dir : "Not found"}</span>
+          <button className="btn small" onClick={chooseKit}>Choose folder…</button>
+          {props.kitDir && <button className="icon-btn" aria-label="Use the default folder" onClick={() => props.onKitDir(null)}>✕</button>}
+        </div>
+        <p className={kit?.found ? "success" : "error-text"}>{kit?.message ?? "Checking…"}</p>
       </section>
 
       <section className="settings-section">

@@ -6,10 +6,10 @@ import {
   TimelineClip, createClip, setTrim, moveClip, removeClip, clipLength, totalDuration, toRenderPlan,
 } from "./timeline.ts";
 import {
-  BUILT_IN_PRESETS, DEFAULT_SETTINGS, ExtrasDraft, Preset, Settings, applyPreset, restorePrefs, toExtras, toTalkStyle,
+  BUILT_IN_PRESETS, DEFAULT_SETTINGS, ExtrasDraft, MotionDraft, Preset, Settings, applyPreset, restorePrefs, toExtras, toMotion, toTalkStyle,
   toTravelStyle,
 } from "./settings.ts";
-import { FontInfo, Inspector } from "./Inspector.tsx";
+import { FontInfo, Inspector, KitStatus } from "./Inspector.tsx";
 import {
   AutoCutResult, BatchDialog, BatchItem, ErrorDialog, ExportDialog, ExportResult, ExportState, PreviewDialog, ProgressDialog, ResultDialog,
   ReviewDialog, ReviewState, SettingsDialog, formatSize, formatTime, plural, reviewEdits,
@@ -59,12 +59,15 @@ function App() {
   const [prefsLoaded, setPrefsLoaded] = useState(false);
   const [presetName, setPresetName] = useState<string | null>(null);
   const [extras, setExtras] = useState<ExtrasDraft>({ hook: "", tags: "" });
+  const [motion, setMotion] = useState<MotionDraft[]>([]);
+  const [kit, setKit] = useState<KitStatus | null>(null);
   const [fonts, setFonts] = useState<FontInfo[]>([]);
   const [fontPreview, setFontPreview] = useState<string | null>(null);
 
   const [job, setJob] = useState<Job>({ kind: "idle" });
   const [review, setReview] = useState<ReviewState | null>(null);
   const [previewPath, setPreviewPath] = useState<string | null>(null);
+  const [previewTitle, setPreviewTitle] = useState<string | undefined>(undefined);
   const [batch, setBatch] = useState<{ items: BatchItem[]; running: boolean } | null>(null);
   const [batchSel, setBatchSel] = useState<string[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -98,6 +101,12 @@ function App() {
     }, 400);
     return () => clearTimeout(t);
   }, [settings, userPresets, prefsLoaded]);
+
+  // Is HyperFrames available? Checked when a graphic is added or the folder changes.
+  useEffect(() => {
+    if (!prefsLoaded || motion.length === 0) return;
+    invoke<KitStatus>("kit_status", { dir: settings.kitDir }).then(setKit).catch(() => setKit(null));
+  }, [prefsLoaded, motion.length > 0, settings.kitDir, settingsOpen]);
 
   useEffect(() => {
     let cancelled = false;
@@ -223,7 +232,7 @@ function App() {
 
   const timelineSegments = () =>
     plan.ok ? plan.segments.map((sg) => ({ sourcePath: sg.sourcePath, inPoint: sg.inPoint, outPoint: sg.outPoint })) : null;
-  const extrasArg = () => toExtras(extras, settings.cta);
+  const extrasArg = () => toExtras(extras, settings.cta, motion, settings.kitDir);
 
   /** Runs `work` while the progress dialog shows the stage text and render progress. */
   async function withProgress<T>(title: string, source: string, work: () => Promise<T>): Promise<T | undefined> {
@@ -333,8 +342,24 @@ function App() {
     );
     if (r) {
       setJob({ kind: "idle" });
+      setPreviewTitle(undefined);
       setPreviewPath(r.outputPath);
     }
+  }
+
+  /** Plays one graphic over the selected video's first seconds (or a plain backdrop). */
+  async function previewMotion(m: MotionDraft) {
+    const [spec] = toMotion([m]);
+    if (!spec) throw new Error("Add some text first (a check mark, star or arrow needs none).");
+    const background = (selectedClip ? selectedClip.sourcePath : selectedMedia?.path) ?? null;
+    const path = await invoke<string>("motion_preview", {
+      spec,
+      orientation: settings.orientation,
+      kitDir: settings.kitDir,
+      background,
+    });
+    setPreviewTitle("Graphic preview");
+    setPreviewPath(path);
   }
 
   async function runBatch() {
@@ -557,6 +582,12 @@ function App() {
         extras={extras}
         setExtras={setExtras}
         chooseMusic={chooseMusic}
+        motion={motion}
+        setMotion={setMotion}
+        kit={kit}
+        openSettings={() => setSettingsOpen(true)}
+        previewMotion={previewMotion}
+        previewOver={selectedClip ? selectedClip.fileName : selectedMedia?.fileName ?? null}
         target={target}
         blocker={blocker}
         running={busy}
@@ -608,9 +639,9 @@ function App() {
       {review && job.kind === "idle" && (
         <ReviewDialog review={review} setReview={setReview} onRender={renderReviewed} onCancel={() => setReview(null)} onPreview={previewReviewed} />
       )}
-      {previewPath && <PreviewDialog path={previewPath} onClose={() => setPreviewPath(null)} />}
+      {previewPath && <PreviewDialog path={previewPath} title={previewTitle} onClose={() => setPreviewPath(null)} />}
       {batch && <BatchDialog items={batch.items} running={batch.running} onClose={() => setBatch(null)} />}
-      {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && <SettingsDialog kitDir={settings.kitDir} onKitDir={(kitDir) => update({ kitDir })} onClose={() => setSettingsOpen(false)} />}
       <ExportDialog state={exportState} onClose={() => setExportState({ kind: "idle" })} />
       {presetName !== null && (
         <Modal

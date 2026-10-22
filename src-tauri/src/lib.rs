@@ -9,6 +9,7 @@ pub mod fonts;
 pub mod frames;
 pub mod inbox;
 pub mod media;
+pub mod motion;
 pub mod plan;
 pub mod prefs;
 pub mod render;
@@ -392,6 +393,43 @@ async fn make_thumbnail(
     Ok(out.to_string_lossy().into_owned())
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KitStatus {
+    found: bool,
+    dir: Option<String>,
+    message: String,
+}
+
+/// Whether HyperFrames (the free247editor kit) can be found, for the Motion tab and Settings.
+#[tauri::command]
+fn kit_status(dir: Option<String>) -> KitStatus {
+    match motion::Kit::find(dir.as_deref()) {
+        Ok(k) => KitStatus { found: true, dir: Some(k.dir.to_string_lossy().into_owned()), message: "HyperFrames is ready.".into() },
+        Err(e) => KitStatus { found: false, dir: None, message: e },
+    }
+}
+
+/// One motion graphic playing over the user's video (or a plain backdrop), as a short MP4 the UI can play.
+#[tauri::command]
+async fn motion_preview(
+    app: tauri::AppHandle,
+    spec: motion::MotionSpec,
+    orientation: render::Orientation,
+    kit_dir: Option<String>,
+    background: Option<String>,
+) -> Result<String, String> {
+    let out = tauri::async_runtime::spawn_blocking(move || {
+        let kit = motion::Kit::find(kit_dir.as_deref())?;
+        let bg = background.as_deref().map(std::path::Path::new);
+        motion::preview(&kit, &spec, orientation, bg, &motion::cache_dir()?)
+    })
+    .await
+    .map_err(|e| format!("Preview task failed: {e}"))??;
+    app.asset_protocol_scope().allow_file(&out).map_err(|e| format!("Could not enable preview: {e}"))?;
+    Ok(out.to_string_lossy().into_owned())
+}
+
 /// Caption font choices for the picker (system and user fonts that can draw Tagalog and English).
 #[tauri::command]
 async fn list_fonts() -> Result<Vec<fonts::FontInfo>, String> {
@@ -471,7 +509,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![probe_media, export_video, api_key_status, save_api_key, remove_api_key, auto_cut, auto_cut_timeline, travel_edit, list_fonts, caption_preview, auto_cut_prepare, auto_cut_render, auto_cut_preview, travel_preview, get_prefs, set_prefs, get_dictionary, set_dictionary, make_thumbnail])
+        .invoke_handler(tauri::generate_handler![probe_media, export_video, api_key_status, save_api_key, remove_api_key, auto_cut, auto_cut_timeline, travel_edit, list_fonts, caption_preview, auto_cut_prepare, auto_cut_render, auto_cut_preview, travel_preview, get_prefs, set_prefs, get_dictionary, set_dictionary, make_thumbnail, kit_status, motion_preview])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

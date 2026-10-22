@@ -391,7 +391,19 @@ fn build_render(dir: &Path, plan_path: &Path, look: &EditStyle, main: bool, cap_
             overlays.push(Overlay { image: png, start: c.out_start, end: c.out_end, y_center_frac: cap_y });
         }
     }
+    let mut video_overlays = Vec::new();
     if let Some(extras) = crate::extras::load(dir)? {
+        if !extras.motion.is_empty() {
+            let (placed, notes) = crate::motion::place(&extras.motion, &v.captions, v.total_sec);
+            for n in &notes {
+                log(dir, &format!("motion: {n}"));
+            }
+            log(dir, &format!("motion: {} animation(s)", placed.len()));
+            if !placed.is_empty() {
+                let kit = crate::motion::Kit::find(extras.kit_dir.as_deref())?;
+                video_overlays = crate::motion::overlays(&kit, &placed, look.orientation, &crate::motion::cache_dir()?)?;
+            }
+        }
         let (placed, notes) = crate::extras::place(&extras, &v.captions, v.total_sec);
         for n in &notes {
             log(dir, &format!("extras: {n}"));
@@ -443,6 +455,7 @@ fn build_render(dir: &Path, plan_path: &Path, look: &EditStyle, main: bool, cap_
         fps: if (1..=120).contains(&fps) { fps } else { 30 },
         fit: if look.fit_blur { Fit::Blur } else { Fit::Crop },
         overlays,
+        video_overlays,
         style: render::Style {
             zoom,
             sfx,

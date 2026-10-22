@@ -25,6 +25,10 @@ pub struct Extras {
     pub tags: Vec<TagSpec>,
     pub cta: Option<String>,
     pub cta_sec: Option<f64>,
+    /// Animated cards, stickers, arrows and lower thirds (rendered by HyperFrames).
+    pub motion: Vec<crate::motion::MotionSpec>,
+    /// The HyperFrames kit folder chosen in Settings (the usual places are tried when empty).
+    pub kit_dir: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -68,7 +72,7 @@ fn norm(t: &str) -> String {
 
 /// Start time of the caption where `phrase` begins, matching across neighbouring captions
 /// (captions hold only 1-3 words, so a phrase usually spans several).
-fn find_phrase(captions: &[ValidCaption], phrase: &str) -> Option<f64> {
+pub fn find_phrase(captions: &[ValidCaption], phrase: &str) -> Option<f64> {
     let words: Vec<&str> = phrase.split_whitespace().collect();
     let phrase = words.iter().map(|w| norm(w)).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ");
     if phrase.is_empty() {

@@ -1,6 +1,6 @@
 // The right-hand panel: how the reel should look and sound, and the button that makes it.
 import { useState } from "react";
-import { CaptionTemplate, ExtrasDraft, Settings } from "./settings.ts";
+import { CaptionTemplate, ExtrasDraft, MotionDraft, MotionTemplate, Settings, newMotion } from "./settings.ts";
 import { Section, Segmented, SelectField, Slider, Tabs, Toggle } from "./ui.tsx";
 
 export type FontInfo = { name: string; path: string };
@@ -13,7 +13,104 @@ const CAPTION_TEMPLATES: { value: CaptionTemplate; label: string }[] = [
   { value: "classic", label: "Classic outline" },
 ];
 
-type Tab = "style" | "audio" | "text" | "output";
+type Tab = "style" | "audio" | "text" | "motion" | "output";
+
+export type KitStatus = { found: boolean; dir: string | null; message: string };
+
+const TEMPLATES: { value: MotionTemplate; label: string; hint: string }[] = [
+  { value: "card", label: "Motion card", hint: "A title card that pops in" },
+  { value: "sticker", label: "Sticker", hint: "Check mark, star or a NEW / SALE badge" },
+  { value: "arrow", label: "Arrow", hint: "A bouncing arrow, with a label" },
+  { value: "lowerThird", label: "Lower third", hint: "A name or place that slides in" },
+];
+
+const ACCENTS = [
+  { value: "rose", label: "Rose" },
+  { value: "plum", label: "Plum" },
+  { value: "gold", label: "Gold" },
+  { value: "teal", label: "Teal" },
+  { value: "white", label: "White" },
+];
+
+const POSITIONS = [
+  { value: "", label: "Default place" },
+  { value: "top", label: "Top" },
+  { value: "middle", label: "Middle" },
+  { value: "bottom", label: "Bottom" },
+  { value: "left", label: "Left" },
+  { value: "right", label: "Right" },
+];
+
+function MotionItem(props: {
+  m: MotionDraft;
+  travel: boolean;
+  onChange: (patch: Partial<MotionDraft>) => void;
+  onRemove: () => void;
+  onPreview: () => Promise<void>;
+}) {
+  const { m } = props;
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const when = m.when.trim();
+  const whenText = when === "" ? "spread across the video" : Number.isFinite(Number(when)) ? `at ${Number(when)} s` : `when "${when}" is said`;
+  async function preview() {
+    setBusy(true);
+    setErr(null);
+    try {
+      await props.onPreview();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  const t = TEMPLATES.find((x) => x.value === m.template)!;
+  const textLabel = m.template === "arrow" ? "Label (optional)" : m.template === "lowerThird" ? "Name or place" : m.template === "sticker" && m.variant !== "badge" ? "Text (not used)" : "Text";
+  return (
+    <div className="motion-item">
+      <div className="motion-head">
+        <span className="motion-kind">{t.label}</span>
+        <button type="button" className="icon-btn" onClick={props.onRemove} aria-label={`Remove this ${t.label}`}>✕</button>
+      </div>
+      <div className="field">
+        <label>{textLabel}</label>
+        <input type="text" value={m.text} disabled={m.template === "sticker" && m.variant !== "badge"} placeholder={m.template === "sticker" ? "NEW" : m.template === "lowerThird" ? "SIARGAO" : "1.5 YEARS NA"}
+          onChange={(e) => props.onChange({ text: e.target.value })} />
+      </div>
+      {(m.template === "card" || m.template === "lowerThird") && (
+        <div className="field">
+          <label>{m.template === "card" ? "Second line (optional)" : "Small line (optional)"}</label>
+          <input type="text" value={m.sub} onChange={(e) => props.onChange({ sub: e.target.value })} />
+        </div>
+      )}
+      {m.template === "sticker" && (
+        <SelectField label="Kind" value={m.variant} options={[{ value: "badge", label: "Text badge" }, { value: "check", label: "Check mark ✓" }, { value: "star", label: "Star" }]} onChange={(variant) => props.onChange({ variant })} />
+      )}
+      {m.template === "arrow" && (
+        <SelectField label="Points" value={m.variant} options={[{ value: "down", label: "Down" }, { value: "up", label: "Up" }, { value: "left", label: "Left" }, { value: "right", label: "Right" }]} onChange={(variant) => props.onChange({ variant })} />
+      )}
+      <div className="motion-row">
+        <div className="field">
+          <label>{props.travel ? "At second" : "At second or phrase"}</label>
+          <input type="text" value={m.when} placeholder={props.travel ? "e.g. 4" : "e.g. 12 or bluetooth"} onChange={(e) => props.onChange({ when: e.target.value })} />
+        </div>
+        <div className="field">
+          <label>Stays (s)</label>
+          <input type="number" min={1} max={12} step={0.5} value={m.dur} onChange={(e) => props.onChange({ dur: Number(e.target.value) || 3 })} />
+        </div>
+      </div>
+      <div className="motion-row">
+        <SelectField label="Place" value={m.position} options={POSITIONS} onChange={(position) => props.onChange({ position })} />
+        <SelectField label="Colour" value={m.accent} options={ACCENTS} onChange={(accent) => props.onChange({ accent })} />
+      </div>
+      <div className="motion-foot">
+        <span className="note">Shows {whenText}, for {m.dur} s.</span>
+        <button type="button" className="btn small" onClick={preview} disabled={busy}>{busy ? "Making preview…" : "▶ Preview"}</button>
+      </div>
+      {err && <p className="error-text">{err}</p>}
+    </div>
+  );
+}
 
 export function Inspector(props: {
   settings: Settings;
@@ -23,6 +120,14 @@ export function Inspector(props: {
   extras: ExtrasDraft;
   setExtras: (d: ExtrasDraft) => void;
   chooseMusic: () => void;
+  motion: MotionDraft[];
+  setMotion: (m: MotionDraft[]) => void;
+  kit: KitStatus | null;
+  openSettings: () => void;
+  /** Plays one graphic over the video (or a plain backdrop); resolves when the preview is on screen. */
+  previewMotion: (m: MotionDraft) => Promise<void>;
+  /** Only an Auto Edit / Travel run can place graphics: tell the user what the preview is drawn over. */
+  previewOver: string | null;
   /** What the main button will work on, e.g. "3 timeline clips" or "mouse.mp4"; null when nothing is ready. */
   target: string | null;
   /** Why the main button is disabled (shown under it), if it is. */
@@ -198,6 +303,39 @@ export function Inspector(props: {
     </>
   );
 
+  const motion = (
+    <>
+      <Section title="Animated graphics">
+        <p className="note">Cards, stickers, arrows and lower thirds that move. They are added when you press the big button below, and are drawn by HyperFrames (the first one takes a few seconds).</p>
+        <p className="note">▶ Preview plays one graphic over {props.previewOver ?? "a plain backdrop (select a video to see it over your footage)"}.</p>
+        {props.kit && !props.kit.found && (
+          <div className="callout warn" role="alert">
+            <p>{props.kit.message}</p>
+            <button type="button" className="btn small" onClick={props.openSettings}>Open Settings</button>
+          </div>
+        )}
+        {props.motion.length === 0 && <p className="note">Nothing added yet.</p>}
+        {props.motion.map((m) => (
+          <MotionItem
+            key={m.id}
+            m={m}
+            travel={travel}
+            onChange={(patch) => props.setMotion(props.motion.map((x) => (x.id === m.id ? { ...x, ...patch } : x)))}
+            onRemove={() => props.setMotion(props.motion.filter((x) => x.id !== m.id))}
+            onPreview={() => props.previewMotion(m)}
+          />
+        ))}
+        <div className="motion-add">
+          {TEMPLATES.map((t) => (
+            <button key={t.value} type="button" className="btn small" title={t.hint} onClick={() => props.setMotion([...props.motion, newMotion(t.value)])}>
+              + {t.label}
+            </button>
+          ))}
+        </div>
+      </Section>
+    </>
+  );
+
   const output = (
     <>
       <Section title="Shapes">
@@ -250,6 +388,7 @@ export function Inspector(props: {
             { value: "style", label: "Style" },
             { value: "audio", label: "Audio" },
             { value: "text", label: "Text" },
+            { value: "motion", label: props.motion.length ? `Motion · ${props.motion.length}` : "Motion" },
             { value: "output", label: "Output" },
           ]}
           onChange={setTab}
@@ -259,6 +398,7 @@ export function Inspector(props: {
         {tab === "style" && style}
         {tab === "audio" && audio}
         {tab === "text" && text}
+        {tab === "motion" && motion}
         {tab === "output" && output}
       </div>
       <div className="inspector-actions">

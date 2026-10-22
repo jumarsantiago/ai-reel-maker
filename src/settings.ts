@@ -38,6 +38,8 @@ export type Settings = {
   musicStartSec: number;
   // Reusable text
   cta: string;
+  // Where HyperFrames (the free247editor kit) is, for animated graphics; null = look in the usual places.
+  kitDir: string | null;
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -69,6 +71,7 @@ export const DEFAULT_SETTINGS: Settings = {
   musicFade: true,
   musicStartSec: 0,
   cta: "",
+  kitDir: null,
 };
 
 export type Preset = { name: string; builtIn?: boolean; settings: Partial<Settings> };
@@ -131,7 +134,7 @@ export function restoreSettings(saved: unknown): Settings {
     const def = DEFAULT_SETTINGS[key];
     const v = s[key];
     if (v === undefined) continue;
-    if (def === null || key === "music" || key === "captionFont") {
+    if (def === null || key === "music" || key === "captionFont" || key === "kitDir") {
       if (v === null || typeof v === "string") (out as Record<string, unknown>)[key] = v;
     } else if (typeof v === typeof def) {
       (out as Record<string, unknown>)[key] = v;
@@ -207,8 +210,57 @@ export function toTravelStyle(s: Settings) {
 
 export type ExtrasDraft = { hook: string; tags: string };
 
-/** Hook / tags / CTA for the commands. One tag per line: "TEXT" or "TEXT | phrase said in the video". */
-export function toExtras(d: ExtrasDraft, cta: string) {
+export type MotionTemplate = "card" | "sticker" | "arrow" | "lowerThird";
+
+/** One animated graphic the user added. `when` is a time in seconds ("12.5") or a phrase said in the video. */
+export type MotionDraft = {
+  id: number;
+  template: MotionTemplate;
+  text: string;
+  sub: string;
+  variant: string;
+  position: string;
+  accent: string;
+  when: string;
+  dur: number;
+};
+
+export const MOTION_DEFAULTS: Record<MotionTemplate, Partial<MotionDraft>> = {
+  card: { variant: "", position: "top", dur: 3 },
+  sticker: { variant: "badge", position: "right", dur: 3 },
+  arrow: { variant: "down", position: "", dur: 3 },
+  lowerThird: { variant: "", position: "bottom", dur: 3.5 },
+};
+
+let nextMotionId = 1;
+export function newMotion(template: MotionTemplate): MotionDraft {
+  // Starts at 1 second so it shows in the first seconds of any preview; change it to place it later.
+  return { id: nextMotionId++, template, text: "", sub: "", variant: "", position: "", accent: "rose", when: "1", dur: 3, ...MOTION_DEFAULTS[template] };
+}
+
+/** The `MotionSpec`s the commands expect; items with nothing to show are left out. */
+export function toMotion(list: MotionDraft[]) {
+  return list
+    .filter((m) => m.text.trim() || (m.template === "sticker" && m.variant !== "badge") || m.template === "arrow")
+    .map((m) => {
+      const when = m.when.trim();
+      const secs = when !== "" && Number.isFinite(Number(when)) ? Number(when) : null;
+      return {
+        template: m.template,
+        text: m.text.trim(),
+        sub: m.sub.trim() || null,
+        variant: m.variant || null,
+        position: m.position || null,
+        accent: m.accent || null,
+        at: secs,
+        phrase: secs === null && when ? when : null,
+        dur: m.dur,
+      };
+    });
+}
+
+/** Hook / tags / CTA / motion graphics for the commands. One tag per line: "TEXT" or "TEXT | phrase said in the video". */
+export function toExtras(d: ExtrasDraft, cta: string, motion: MotionDraft[] = [], kitDir: string | null = null) {
   const tags = d.tags
     .split("\n")
     .map((line) => line.trim())
@@ -219,8 +271,9 @@ export function toExtras(d: ExtrasDraft, cta: string) {
     });
   const hook = d.hook.trim();
   const c = cta.trim();
-  if (!hook && !c && tags.length === 0) return null;
-  return { hook: hook || null, tags, cta: c || null };
+  const m = toMotion(motion);
+  if (!hook && !c && tags.length === 0 && m.length === 0) return null;
+  return { hook: hook || null, tags, cta: c || null, motion: m, kitDir };
 }
 
 export type SavedPrefs = { last: Settings; presets: Preset[] };

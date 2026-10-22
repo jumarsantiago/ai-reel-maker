@@ -61,6 +61,8 @@ pub struct Plan {
     pub fps: u32,
     pub fit: Fit,
     pub overlays: Vec<Overlay>,
+    /// Transparent animated clips (WebM) shown over the picture, under the captions.
+    pub video_overlays: Vec<VideoOverlay>,
     pub style: Style,
     /// Quick, lower-quality encode for previews.
     pub fast: bool,
@@ -92,6 +94,10 @@ impl Plan {
         let end = plan_total(&p);
         p.overlays.retain(|o| o.start < end - 0.05);
         for o in &mut p.overlays {
+            o.end = o.end.min(end);
+        }
+        p.video_overlays.retain(|o| o.start < end - 0.05);
+        for o in &mut p.video_overlays {
             o.end = o.end.min(end);
         }
         if let Some(fx) = &mut p.style.sfx {
@@ -271,6 +277,14 @@ fn same_shape(src_w: u32, src_h: u32, w: u32, h: u32) -> bool {
 
 /// A still image (e.g. a caption PNG) shown over the output between `start` and `end`
 /// (output-timeline seconds), horizontally centred with its centre at `y_center_frac` of the height.
+/// A transparent animated clip (WebM with alpha) shown over the reel from `start` to `end` (output seconds).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoOverlay {
+    pub path: PathBuf,
+    pub start: f64,
+    pub end: f64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Overlay {
     pub image: PathBuf,
@@ -328,6 +342,7 @@ pub fn plan_segments(
         fps: if (1..=120).contains(&fps) { fps } else { 30 },
         fit: Fit::Pad,
         overlays: Vec::new(),
+        video_overlays: Vec::new(),
         style: Style::default(),
         fast: false,
     })
@@ -432,7 +447,7 @@ pub fn build_filter_graph(plan: &Plan) -> String {
     let n = plan.segments.len();
     let fade = plan.style.fade_sec.min(total / 3.0).max(0.0);
     let vfade = if fade > 0.05 { format!("fade=t=in:st=0:d={f:.2},fade=t=out:st={o:.3}:d={f:.2}", f = fade, o = total - fade) } else { String::new() };
-    let video_out = if plan.overlays.is_empty() && vfade.is_empty() { "[outv]" } else { "[cv]" };
+    let video_out = if plan.overlays.is_empty() && plan.video_overlays.is_empty() && vfade.is_empty() { "[outv]" } else { "[cv]" };
     let sfx_times = plan.style.sfx.as_ref().map(|x| x.times.as_slice()).unwrap_or(&[]);
     let audio_post = any_audio
         && (plan.style.music.is_some() || !sfx_times.is_empty() || plan.style.loudnorm || fade > 0.05 || plan.style.video_volume.is_some());
@@ -463,8 +478,19 @@ pub fn build_filter_graph(plan: &Plan) -> String {
     } else {
         graph += &format!("{concat_inputs}concat=n={n}:v=1:a=0{video_out}");
     }
-    // Overlay inputs follow the segment inputs; each is enabled only during its time window.
+    // Animated motion graphics (transparent WebM) go over the picture first, so captions stay on top. Their
+    // inputs follow the caption images; each is shifted to start at its own time.
     let mut prev = "cv".to_string();
+    for (k, v) in plan.video_overlays.iter().enumerate() {
+        let label = format!("m{k}");
+        graph += &format!(
+            ";[{idx}:v]format=rgba,setpts=PTS-STARTPTS+{s}/TB[mk{k}];[{prev}][mk{k}]overlay=0:0:eof_action=pass:format=auto[{label}]",
+            idx = n + plan.overlays.len() + k,
+            s = secs(v.start),
+        );
+        prev = label;
+    }
+    // Caption images follow the segment inputs; each is enabled only during its time window.
     for (k, o) in plan.overlays.iter().enumerate() {
         let last = k + 1 == plan.overlays.len();
         let label = if last { "outv".to_string() } else { format!("o{k}") };
@@ -483,13 +509,14 @@ pub fn build_filter_graph(plan: &Plan) -> String {
         );
         prev = label;
     }
-    if plan.overlays.is_empty() && !vfade.is_empty() {
-        graph += &format!(";[cv]{vfade},format=yuv420p[outv]");
+    if plan.overlays.is_empty() && (!vfade.is_empty() || !plan.video_overlays.is_empty()) {
+        let fade_part = if vfade.is_empty() { String::new() } else { format!("{vfade},") };
+        graph += &format!(";[{prev}]{fade_part}format=yuv420p[outv]");
     }
     if audio_post {
         let fmt = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
         let loudnorm = "loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000";
-        let mut idx = n + plan.overlays.len();
+        let mut idx = n + plan.overlays.len() + plan.video_overlays.len();
         let mut mix: Vec<String> = Vec::new();
         // The clips' own sound: levelled to -14 LUFS first (so the music volume below is relative to the
         // voice, not to whatever the camera recorded), then set to the chosen volume.
@@ -575,6 +602,11 @@ pub fn build_ffmpeg_args(plan: &Plan, output: &Path) -> Vec<OsString> {
         // One decoder per caption image: a single thread each, or hundreds of them exhaust macOS's per-process thread limit.
         args.extend(["-threads", "1", "-i"].map(OsString::from));
         args.push(o.image.clone().into_os_string());
+    }
+    for v in &plan.video_overlays {
+        // Transparent WebM needs the libvpx decoder to keep its alpha channel.
+        args.extend(["-c:v", "libvpx-vp9", "-i"].map(OsString::from));
+        args.push(v.path.clone().into_os_string());
     }
     let any_audio = has_audio_track(plan);
     if let (true, Some(m)) = (any_audio, &plan.style.music) {
@@ -861,6 +893,33 @@ mod tests {
             assert_eq!(o.short_side(), 1080);
             assert!(o.tag_y() < o.hook_y() && o.hook_y() < o.caption_y() && o.caption_y() < o.cta_y());
         }
+    }
+
+    #[test]
+    fn motion_overlays_sit_under_captions_and_keep_inputs_in_order() {
+        let mut plan = plan_segments(&[seg("/v/a.mp4", 0.0, 4.0)], fake_probe).unwrap();
+        plan.width = 1080;
+        plan.height = 1920;
+        plan.fit = Fit::Crop;
+        plan.overlays = vec![Overlay { image: "/p/c.png".into(), start: 0.0, end: 1.0, y_center_frac: 0.7 }];
+        plan.video_overlays = vec![
+            VideoOverlay { path: "/m/a.webm".into(), start: 1.5, end: 4.0 },
+            VideoOverlay { path: "/m/b.webm".into(), start: 2.0, end: 4.0 },
+        ];
+        plan.style.music = Some(Music { path: "/m/song.mp3".into(), gain_db: -16.0, start_sec: 0.0, fade: false });
+        let g = build_filter_graph(&plan);
+        assert!(g.contains(";[2:v]format=rgba,setpts=PTS-STARTPTS+1.500/TB[mk0];[cv][mk0]overlay=0:0:eof_action=pass:format=auto[m0]"), "{g}");
+        assert!(g.contains(";[3:v]format=rgba,setpts=PTS-STARTPTS+2.000/TB[mk1];[m0][mk1]overlay=0:0:eof_action=pass:format=auto[m1]"), "{g}");
+        assert!(g.contains(";[m1][1:v]overlay=") && g.contains("[outv]"), "captions come last: {g}");
+        assert!(g.contains("[4:a:0]"), "music follows caption images and motion clips: {g}");
+        let args: Vec<String> = build_ffmpeg_args(&plan, Path::new("/o.mp4")).into_iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let inputs: Vec<&String> = args.windows(2).filter(|w| w[0] == "-i").map(|w| &w[1]).collect();
+        assert_eq!(inputs, ["/v/a.mp4", "/p/c.png", "/m/a.webm", "/m/b.webm", "/m/song.mp3"]);
+        assert!(args.windows(3).any(|w| w[0] == "-c:v" && w[1] == "libvpx-vp9" && w[2] == "-i"));
+        // With no captions the motion chain ends in the output itself.
+        plan.overlays.clear();
+        let g = build_filter_graph(&plan);
+        assert!(g.contains(";[m1]format=yuv420p[outv]"), "{g}");
     }
 
     #[test]

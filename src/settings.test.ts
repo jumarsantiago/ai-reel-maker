@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  BUILT_IN_PRESETS, DEFAULT_SETTINGS, applyPreset, restorePrefs, restoreSettings, toExtras, toTalkStyle, toTravelStyle,
+  BUILT_IN_PRESETS, DEFAULT_SETTINGS, applyPreset, newMotion, restorePrefs, restoreSettings, toExtras, toMotion, toTalkStyle, toTravelStyle,
 } from "./settings.ts";
 
 test("restoreSettings keeps valid fields and ignores damaged ones", () => {
@@ -40,7 +40,7 @@ test("styles map to the Rust command fields", () => {
 test("extras: tags with and without phrases, empty means none", () => {
   assert.equal(toExtras({ hook: " ", tags: "\n" }, " "), null);
   const x = toExtras({ hook: "HOOK", tags: "A | apple\nB" }, "CTA");
-  assert.deepEqual(x, { hook: "HOOK", tags: [{ text: "A", phrase: "apple" }, { text: "B" }], cta: "CTA" });
+  assert.deepEqual(x, { hook: "HOOK", tags: [{ text: "A", phrase: "apple" }, { text: "B" }], cta: "CTA", motion: [], kitDir: null });
 });
 
 test("restorePrefs reads user presets and drops broken ones", () => {
@@ -49,4 +49,22 @@ test("restorePrefs reads user presets and drops broken ones", () => {
   assert.equal(p.presets.length, 1);
   assert.equal(p.presets[0].settings.musicVolume, 33);
   assert.deepEqual(restorePrefs("garbage"), { last: DEFAULT_SETTINGS, presets: [] });
+});
+
+test("motion drafts: seconds or phrase, empty ones dropped, kit folder passed along", () => {
+  const card = { ...newMotion("card"), text: " 1.5 YEARS ", when: "12.5" };
+  const byPhrase = { ...newMotion("sticker"), text: "NEW", when: "ergonomic" };
+  const empty = newMotion("card");
+  const arrow = newMotion("arrow");
+  assert.equal(empty.when, "1", "new graphics start at 1 s so they show in a preview");
+  const m = toMotion([card, byPhrase, empty, arrow]);
+  assert.equal(m.length, 3, "an empty card is dropped, an arrow needs no text");
+  assert.deepEqual([m[0].at, m[0].phrase, m[0].text], [12.5, null, "1.5 YEARS"]);
+  assert.deepEqual([m[1].at, m[1].phrase, m[1].variant], [null, "ergonomic", "badge"]);
+  assert.equal(m[2].variant, "down");
+  const x = toExtras({ hook: "", tags: "" }, "", [card], "/kit");
+  assert.equal(x?.kitDir, "/kit");
+  assert.equal(x?.motion.length, 1);
+  assert.equal(toExtras({ hook: "", tags: "" }, "", [empty]), null);
+  assert.equal(restoreSettings({ kitDir: "/k" }).kitDir, "/k");
 });

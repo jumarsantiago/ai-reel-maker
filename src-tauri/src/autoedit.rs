@@ -759,14 +759,19 @@ pub fn join_timeline(
     stage(&format!("Joining {} clip(s)…", segments.len()));
     let work = root.join("timeline-sources");
     std::fs::create_dir_all(&work).map_err(|e| format!("Cannot create {}: {e}", work.display()))?;
+    static JOINED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let joined = work.join(format!("timeline-{secs}.mp4"));
-    let req = crate::render::ExportRequest {
-        segments: segments.to_vec(),
-        output_path: joined.to_string_lossy().into_owned(),
-        overwrite_confirmed: false,
-    };
-    crate::render::export(&req, |_| {})?;
+    let n = JOINED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // The counter keeps two joins in the same second from picking the same file.
+    let joined = work.join(if n == 0 { format!("timeline-{secs}.mp4") } else { format!("timeline-{secs}-{n}.mp4") });
+    // The working video takes the chosen shape (not the first clip's), so a vertical reel stays vertical even
+    // when the first clip is horizontal, and clips of another shape are cropped or blurred like in the final render.
+    let mut plan = crate::render::plan_segments(segments, crate::media::probe)?;
+    let (width, height) = look.orientation.size();
+    plan.width = width;
+    plan.height = height;
+    plan.fit = if look.fit_blur { crate::render::Fit::Blur } else { crate::render::Fit::Crop };
+    crate::render::render_to(&plan, &joined, false, |_| {})?;
     Ok(joined)
 }
 
@@ -810,6 +815,38 @@ mod tests {
         write_json(&dir.join("transcript.json"), &t).unwrap();
         write_json(&dir.join("plan.autocut.json"), &crate::autoplan::auto_plan(&t)).unwrap();
         (dir, t)
+    }
+
+    /// A vertical reel stays vertical even when the first clip is horizontal (it used to follow the first clip).
+    #[test]
+    fn joined_timeline_follows_the_chosen_shape_not_the_first_clip() {
+        let Some(ffmpeg) = crate::media::find_tool("ffmpeg") else { return };
+        let dir = std::env::temp_dir().join(format!("arm-join-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |name: &str, size: &str| {
+            let p = dir.join(name);
+            assert!(std::process::Command::new(&ffmpeg)
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i", &format!("testsrc2=size={size}:rate=25:duration=2"), "-f", "lavfi", "-i", "sine=duration=2", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+                .arg(&p)
+                .status()
+                .unwrap()
+                .success());
+            p.to_string_lossy().into_owned()
+        };
+        let wide = mk("wide.mp4", "320x180");
+        let tall = mk("tall.mp4", "180x320");
+        let seg = |p: &str| crate::render::SegmentRequest { source_path: p.into(), in_point: 0.0, out_point: 1.5 };
+        let mut look = EditStyle::default();
+        look.orientation = Orientation::Vertical;
+        let out = join_timeline(&[seg(&wide), seg(&tall)], &dir, &look, |_| {}).unwrap();
+        let info = crate::media::probe(&out.to_string_lossy()).unwrap();
+        assert_eq!((info.width, info.height), (1080, 1920), "vertical stays vertical");
+        look.orientation = Orientation::Horizontal;
+        let out = join_timeline(&[seg(&tall), seg(&wide)], &dir, &look, |_| {}).unwrap();
+        let info = crate::media::probe(&out.to_string_lossy()).unwrap();
+        assert_eq!((info.width, info.height), (1920, 1080), "horizontal stays horizontal");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

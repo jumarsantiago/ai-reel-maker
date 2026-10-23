@@ -107,6 +107,7 @@ pub fn prompt() -> String {
         "You are planning the edit of one video from its transcript.",
         "1. Read the file request.json in the current folder. Its \"system\" field holds the rules, its first message holds the task and the transcript, and output_config.format.schema is the JSON schema your answer must follow.",
         "2. Follow those rules exactly. Use only words that are in the transcript. Do not invent anything.",
+        "   Consistency, which the app checks and rejects the whole plan for: a removal must NEVER overlap any kept segment, not even by a fraction of a second. If you want to cut a pause inside speech, end one kept segment before it and start the next one after it, so the cut is a gap between segments. Every removal needs evidence word ids from the transcript near that time. Segments must not overlap each other. Before writing, check every removal against every segment.",
         &format!("3. Write ONLY the finished JSON plan (an object that matches the schema, no markdown, no comments) to a new file named {PLAN_FILE} in the current folder, using the Write tool."),
         "4. Do nothing else: do not change any other file, and do not run commands. When the file is written, reply with the single word: done.",
     ]
